@@ -1,0 +1,12 @@
+absl-py
+dataclasses-json
+filelock
+fuse-python >= 1.0.8
+marshmallow
+marshmallow-dataclass2
+mypy
+pip-tools
+pre-commit
+psutil
+result
+types-psutil

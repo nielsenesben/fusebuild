@@ -1,0 +1,1541 @@
+#
+#    Copyright (C) 2025 Esben Nielsen <nielsen.esben@gmail.com>
+#
+# Based on LibFuse example:
+#    Copyright (C) 2001  Jeff Epler  <jepler@unpythonic.dhs.org>
+#    Copyright (C) 2006  Csaba Henk  <csaba.henk@creo.hu>
+#
+#    This program can be distributed under the terms of the GNU LGPL.
+#    See the file COPYING.
+#
+
+from __future__ import print_function
+
+from abc import ABC, abstractmethod
+import os, sys, signal
+import json
+import tempfile
+from errno import *
+from stat import *
+import fcntl
+import time
+from pathlib import Path
+from threading import Lock
+import threading
+import hashlib
+import subprocess
+import shutil
+from typing import Any, Optional, Protocol, Iterable
+from dataclasses import dataclass, field
+from io import TextIOWrapper
+from result import Result, Ok, Err
+import uuid
+import psutil
+from filelock import FileLock
+import importlib.util
+import traceback
+from threading import Thread, Lock
+
+from fusebuild.core.action import (
+    ActionLabel,
+    Action,
+    TmpDir,
+    RandomTmpDir,
+    Mapping,
+    MappingDefinition,
+)
+
+from enum import Enum
+from marshmallow_dataclass2 import class_schema
+from fusebuild.core.dependency import (
+    AccessType,
+    DependencyIndex,
+    DependencyValue,
+    DependencyRecord,
+    StatRecordDir,
+    StatRecordFile,
+    check_file_hash,
+    get_file_hash,
+    ActionSetupRecorder,
+)
+
+import marshmallow_dataclass2
+
+# pull in some spaghetti to make this stuff work without fuse-py being installed
+try:
+    import _find_fuse_parts  # type: ignore
+except ImportError:
+    pass
+import fuse  # type: ignore
+from fuse import Fuse, FuseArgs, FuseError
+import fusebuild.core.logger as logger_module
+
+logger = logger_module.getLogger(__name__)
+# logger.setLevel(logging.DEBUG)
+
+FUSEBUILD_INVOCATION_DIR = "FUSEBUILD_INVOCATION_DIR"
+
+FUSEBUILD_CACHE_DIR = "FUSEBUILD_CACHE_DIR"
+if FUSEBUILD_CACHE_DIR in os.environ:
+    fusebuild_folder = Path(os.environ[FUSEBUILD_CACHE_DIR])
+else:
+    fusebuild_folder = Path.home() / ".cache" / "fusebuild"
+
+output_folder_root = fusebuild_folder / "output"
+output_folder_root_str = str(output_folder_root)
+action_folder_root = fusebuild_folder / "actions"
+action_folder_root_str = str(action_folder_root)
+
+if not hasattr(fuse, "__version__"):
+    raise RuntimeError(
+        "your fuse-py doesn't know of fuse.__version__, probably it's too old."
+    )
+
+fuse.fuse_python_api = (0, 2)
+
+fuse.feature_assert("stateful_files", "has_init")
+
+
+def os_environ() -> dict[str, str]:
+    return {k: os.environ[k] for k in os.environ}
+
+
+def check_pid(pid):
+    """Check For the existence of a unix pid."""
+    psutil.process_iter.cache_clear()
+    return psutil.pid_exists(pid)
+
+
+def kill_subprocess(process: subprocess.Popen | psutil.Popen):
+    pid = process.pid
+
+    if not check_pid(pid):
+        return
+
+    logger.debug(f"Trying to terminate group {pid=}")
+    try:
+        os.kill(pid, signal.SIGINT)
+    except BaseException as e:
+        logger.warning(f"Failed to send sigterm to {pid=}: {type(e)=} {e}")
+        for p in psutil.process_iter():
+            logger.debug(f"   {p}")
+
+    logger.debug(f"Trying to terminate group {pid=}")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except BaseException as e:
+        logger.warning(f"Failed to send sigterm to {pid=}: {type(e)=} {e}")
+        for p in psutil.process_iter():
+            logger.debug(f"   {p}")
+
+    start = time.time()
+    while check_pid(pid):
+        time.sleep(0.1)
+        if time.time() - start >= 1.0:
+            break
+
+    if not check_pid(pid):
+        return
+
+    logger.debug(f"Trying to kill process group {pid=}")
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except BaseException as e:
+        logger.warning(f"Failed to send sigkill to {pid=}:  {type(e)=}  {e}")
+
+
+def flag2mode(flags):
+    md = {os.O_RDONLY: "rb", os.O_WRONLY: "wb", os.O_RDWR: "wb+"}
+    m = md[flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)]
+
+    if flags | os.O_APPEND:
+        m = m.replace("w", "a", 1)
+
+    return m
+
+
+def is_rule_output(path: str) -> bool:
+    res = os.path.commonprefix([output_folder_root_str, path]) == output_folder_root_str
+    logger.debug(f"is_rule_output {path}: {res}")
+    return res
+
+
+def do_nothing():
+    pass
+
+
+def run_action(directory: Path, target: str) -> int:
+    logger.debug(f"Run action {directory} / {target}")
+    try:
+        process = psutil.Popen(
+            [
+                "python3",
+                str(Path(__file__).parent / "runtarget.py"),
+                str(directory.absolute() / "FUSEBUILD.py"),
+                target,
+            ],
+            env=os.environ,
+        )
+        res = process.wait()
+    except:
+        logger.error(f"Something went wrong when invoking {directory} / {target}")
+        if process is not None:
+            kill_subprocess(process)
+        raise
+    return res
+
+
+# Once a dependency is checked in an invocation, it stays ok
+dependencies_ok: dict[tuple[Path, str], bool] = {}
+
+
+dependency_record_schema = class_schema(DependencyRecord)()
+
+
+@dataclass(frozen=False)
+class AccessRecorder:
+    central_dir: Path
+    access_log: TextIOWrapper
+    action_deps_file: Path
+    accesses: dict[DependencyIndex, DependencyValue] = field(default_factory=dict)
+    listener: Any = do_nothing
+    waiting_for: set[tuple[Path, str]] = field(default_factory=set)
+    action_deps: set[ActionLabel] = field(default_factory=set)
+    mutex: Lock = Lock()
+
+    def __post_init__(self) -> None:
+        self.action_deps = set(load_action_deps(self.action_deps_file))
+        self.mutex = Lock()
+
+    def _report_change(self):
+        self.listener()
+
+    def _record_path(self, path: str | Path) -> tuple[bool, str]:
+        if type(path) is not str:
+            path = str(path)
+        assert type(path) is str
+        if is_rule_output(path):
+            return (
+                True,
+                os.path.relpath(path, output_folder_root_str + str(self.central_dir)),
+            )
+        else:
+            return (False, os.path.relpath(path, self.central_dir))
+
+    @staticmethod
+    def _stat_records(stat: os.stat_result) -> DependencyValue:
+        if (stat.st_mode & S_IFDIR) != 0:
+            return StatRecordDir(stat.st_mode)
+        else:
+            return StatRecordFile(stat.st_mode, stat.st_size)
+
+    def write_entry(self, index: DependencyIndex, value: DependencyValue) -> None:
+        with self.mutex:
+            if index in self.accesses:
+                if self.accesses[index] == value:
+                    # No need to write same entry more than once
+                    return
+                if self.accesses[index] is None:
+                    # Is already marked as changed-under-build:
+                    return
+                logger.error(
+                    f"Dependency changed while building for {index}: {value} != {self.accesses[index]}"
+                )
+                # Inserted value which will not match real => rebuild next time
+                value = None
+            self.accesses[index] = value
+            record = DependencyRecord(index, value)
+            record_js = dependency_record_schema.dump(record)
+            js = json.dumps(record_js, ensure_ascii=True)
+            self.access_log.write(js + "\n")
+
+    def record_access(self, path: str, mode: int, res: int) -> None:
+
+        self.write_entry(
+            DependencyIndex(self._record_path(path), AccessType.ACCESS, mode), res
+        )
+
+    def record_stat(self, path, res: os.stat_result) -> None:
+        self.write_entry(
+            DependencyIndex(self._record_path(path), AccessType.STAT),
+            self._stat_records(res),
+        )
+
+    @staticmethod
+    def _read_dir(entries: list[str]) -> str:
+        entries.sort()
+        sha = hashlib.sha256()
+        for f in entries:
+            sha.update(f.encode("UTF-8"))
+
+        return sha.hexdigest()
+
+    def record_readdir(self, path: str, to_record: list[str]) -> None:
+        self.write_entry(
+            DependencyIndex(self._record_path(path), AccessType.READDIR),
+            self._read_dir(to_record),
+        )
+
+    @staticmethod
+    def _read_file_check(path: Path, expected: str) -> bool:
+        stat = os.lstat(path)
+
+        if not check_file_hash(path, stat, expected):
+            return False
+
+        return True
+
+    def record_read(self, path: str) -> None:
+        is_output, record_path = self._record_path(path)
+        if not is_output:
+            stat = os.lstat(path)
+            hash = get_file_hash(path, stat)
+            self.write_entry(
+                DependencyIndex((is_output, record_path), AccessType.READ), hash
+            )
+
+    def record_readlink(self, path: Path, res: str) -> None:
+        is_output, record_path = self._record_path(path)
+        if not is_output:
+            self.write_entry(
+                DependencyIndex((is_output, record_path), AccessType.READLINK), res
+            )
+
+    def record_dir_exists(self, path: Path, exists: bool) -> None:
+        is_output, record_path = self._record_path(path)
+        assert not is_output
+        self.write_entry(
+            DependencyIndex((is_output, record_path), AccessType.DIR_EXISTS), exists
+        )
+
+    @staticmethod
+    def _read_link_check(path: Path, res: str) -> bool:
+        rl = os.readlink(path)
+        logger.debug(f"{rl=}")
+        return str(rl) == res
+
+    @staticmethod
+    def _dir_exists_check(path: Path, expected: bool) -> bool:
+        actual = path.is_dir()
+        logger.debug(f"{expected=} {actual=}")
+        return actual == expected
+
+    def flush(self):
+        with self.action_deps_file.open("w") as f:
+            for ad in self.action_deps:
+                f.write(f"{ad[0]}/{ad[1]}\n")
+
+
+def check_build_target(src_dir: Path) -> tuple[bool, ActionLabel | None]:
+    src_dir = src_dir.absolute()
+    while True:
+        logger.debug(f"{src_dir=}")
+
+        target = src_dir.name
+        src_dir = src_dir.parent
+        build_file = src_dir / "FUSEBUILD.py"
+        logger.debug(f"{build_file=}")
+        if build_file.exists():
+            break
+        if src_dir == Path("/"):
+            return True, None
+
+    label = (src_dir, target)
+
+    if label in dependencies_ok:
+        logger.debug(f"{label} was in dependencies_ok")
+        return True, label
+
+    if FUSEBUILD_INVOCATION_DIR in os.environ:
+        if Path(
+            os.environ[FUSEBUILD_INVOCATION_DIR] + "/ok/" + str(src_dir) + "/" + target
+        ).exists():
+            logger.debug(f"{label} was present in ok dir.")
+            dependencies_ok[label] = True
+            return True, label
+
+        if Path(
+            os.environ[FUSEBUILD_INVOCATION_DIR]
+            + "/failed/"
+            + str(src_dir)
+            + "/"
+            + target
+        ).exists():
+            logger.debug(f"{label} was already marked as failed.")
+            return False, label
+
+    action = get_action(src_dir, target)
+    match action:
+        case None:
+            # clean_nonexisting_action(src_dir, target)
+            return True, label
+        case int(res):
+            return False, label
+        case _:  # Action
+            pass
+
+    logger.info(f"Dependency {src_dir}/{target}")
+    res = run_action(src_dir, target)
+    logger.info(f"Dependency {src_dir}/{target} returned {res}")
+    if res == 0:
+        dependencies_ok[label] = True
+        return True, label
+
+    return False, label
+
+
+def check_accesses(label: ActionLabel) -> bool:
+    merge_access_logs(label)
+    try:
+        return check_accesses_inner_loop(label)
+    except FileNotFoundError as e:
+        logger.debug(f"Got {e=}")
+        return False
+    except json.decoder.JSONDecodeError as e:
+        logger.warning(f"Got decodig exception {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Got exception {e=} while parsing access log")
+        sys.exit(1)
+        return False
+
+
+def access_log_file(label: ActionLabel) -> Path:
+    return action_dir(label) / "access_log.json"
+
+
+def new_access_log_file(label: ActionLabel) -> Path:
+    return action_dir(label) / "new_access_log.json"
+
+
+def check_accesses_inner_loop(label: ActionLabel) -> bool:
+    matches = True
+    central_dir = label[0].absolute()
+    access_log = access_log_file(label)
+    with access_log.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not matches:
+                break
+            d: DependencyRecord = dependency_record_schema.load(json.loads(line))
+            key = d.index
+            expected = d.value
+            src_path = (central_dir / key.path[1]).absolute()
+            if not key.path[0]:
+                path = src_path
+            else:
+                path = Path(output_folder_root_str + str(src_path))
+                if src_path.is_dir():
+                    if not path.is_dir():
+                        matches = False
+                        break
+                else:
+                    check_build_target(src_path)
+
+            logger.debug(f"Checking {path} for {key}")
+            match key.access_type:
+                case AccessType.ACCESS:
+                    if os.access(path, key.access_mode) != expected:
+                        logger.info(f"access({path}, {key}) != {expected}")
+                        print(f"{path} access {key.access_mode} changed")
+                        matches = False
+                        break
+                case AccessType.STAT:
+                    if AccessRecorder._stat_records(os.lstat(path)) != expected:
+                        logger.info(f"lstat({path}) {os.lstat(path)} != {expected}")
+                        print(f"{path} stat changed")
+                        matches = False
+                        break
+                case AccessType.READDIR:
+                    files = list(os.listdir(path))
+                    if AccessRecorder._read_dir(files) != expected:
+                        logger.info(f"readdir({path}) != {expected}")
+                        print(f"readdir of {path} changed")
+                        matches = False
+                        break
+                case AccessType.READ:
+                    assert isinstance(expected, str)
+                    if not AccessRecorder._read_file_check(path, expected):
+                        logger.info(f"read({path}) != {expected}")
+                        print(f"{path} contents changed")
+                        matches = False
+                        break
+                case AccessType.READLINK:
+                    assert isinstance(expected, str)
+                    if not AccessRecorder._read_link_check(path, expected):
+                        logger.info(f"readlink({path}) != {expected}")
+                        print(f"{path} readlink changed")
+                        matches = False
+                        break
+                case AccessType.DIR_EXISTS:
+                    expected = bool(expected)
+                    assert isinstance(expected, bool)
+                    if not AccessRecorder._dir_exists_check(path, expected):
+                        logger.info(f"is_dir({path}) != {expected}")
+                        if expected:
+                            print(f"Directory {path} is no longer a directory.")
+                        else:
+                            print(f"New directory {path}")
+
+                        matches = False
+                        break
+                case _:
+                    logger.error("Unknown access: {key=} {expected=}")
+                    matches = False
+                    break
+
+    return matches
+
+
+class BasicMount(Fuse):
+    def __init__(
+        self,
+        label: ActionLabel,
+        mountpoint: Path,
+        access_recorder: AccessRecorder,
+        writeable: str,
+        mappings: list[MappingDefinition] = [],
+        *args,
+        **kw,
+    ):
+        self.label = label
+        self.fuse_args = FuseArgs()
+        self.fuse_args.setmod("foreground")
+        self.fuse_args.mountpoint = str(mountpoint.absolute())
+        self.fuse_args.optlist = ["auto_unmount", "intr"]
+        self.mountpoint = mountpoint
+        self.subbuild_failed = False
+
+        Fuse.__init__(self, *args, fuse_args=self.fuse_args, **kw)
+        self.root = "/"
+        self.writeable = writeable
+        self.access_recorder = access_recorder
+        self.mappings = [m.create(output_folder_root) for m in mappings]
+        logger.debug(f"{self.mappings=}")
+
+    def is_rule_output(self, path):
+        return is_rule_output(path)
+
+    def handle_other_rule_output(self, path: str) -> None:
+        if not self.is_rule_output(path):
+            return
+
+        if self.is_writeable(path):
+            return
+
+        relative_to_output_root = Path(path).relative_to(output_folder_root)
+        logger.debug(f"{relative_to_output_root=}")
+        src_dir = Path("/") / relative_to_output_root
+
+        if src_dir.is_dir():
+            dirtocreate = Path(output_folder_root_str + str(src_dir))
+            logger.info(
+                f"Creating dir {dirtocreate} for some potential deper action  in {src_dir}"
+            )
+            dirtocreate.mkdir(exist_ok=True)
+            self.access_recorder.record_dir_exists(src_dir, True)
+        else:
+            self.access_recorder.record_dir_exists(src_dir, False)
+            success, label = check_build_target(src_dir)
+            if label is not None:
+                self.access_recorder.action_deps.add(label)
+            if not success:
+                with (action_dir(self.label) / "subbuild_faild").open("a") as f:
+                    if label is None:
+                        f.write("something odd")
+                    else:
+                        f.write(f"{label[0]}/{label[1]}\n")
+
+            self.access_recorder.listener()
+
+    def is_writeable(self, path):
+        res = os.path.commonprefix([self.writeable, path]) == self.writeable
+        logger.debug(f"is_writeable {path}: {res}")
+        if False:
+            import traceback
+
+            for line in traceback.format_stack():
+                logger.debug(line.strip())
+        return res
+
+    def remap(self, path: Path) -> tuple[str, bool]:
+        is_output = self.is_rule_output(path)
+        for mapper in self.mappings:
+            remapped = mapper.remap(path, is_output)
+            if remapped is not None:
+                logger.debug(f"Remapping {path=} -> {remapped=}")
+                path_str = str(remapped)
+                return path_str, self.is_rule_output(path_str)
+
+        logger.debug(f"{path=} {is_output=}")
+        return str(path), is_output
+
+    def common_handle_path(self, path: Path) -> tuple[str, bool]:
+        path_str, is_output = self.remap(path)
+        if is_output:
+            self.handle_other_rule_output(path_str)
+        return path_str, is_output
+
+    def getattr(self, path):
+        path, is_output = self.common_handle_path(path)
+        res = os.lstat("." + path)
+        logger.debug(f"getattr {path} {res}")
+        if not self.is_writeable(path):
+            self.access_recorder.record_stat(path, res)
+        if False and not self.is_writeable(path):
+            res.st_mode &= 0o7666
+
+        return res
+
+    def readlink(self, path):
+        path, is_output = self.common_handle_path(path)
+        res = os.readlink("." + path)
+        if not self.is_writeable(path):
+            self.access_recorder.record_readlink(path, res)
+        return res
+
+    def readdir(self, path, offset):
+        path, is_output = self.common_handle_path(path)
+        logger.debug(f"readdir {path} {offset}")
+        to_record = []
+        for e in os.listdir("." + path):
+            to_record.append(e)
+            res = fuse.Direntry(e)
+            yield res
+        if not self.is_writeable(path):
+            self.access_recorder.record_readdir(path, to_record)
+
+    def unlink(self, path):
+        path, is_output = self.remap(path)
+        logger.debug(f"unlink {path}")
+        if self.is_writeable(path):
+            os.unlink("." + path)
+
+    def rmdir(self, path):
+        path, is_output = self.remap(path)
+        logger.debug(f"rmdir {path}")
+        if self.is_writeable(path):
+            os.rmdir("." + path)
+
+    def symlink(self, path, path1):
+        path, is_output = self.remap(path)
+        path1, is_putput1 = self.remap(path1)
+        if self.is_writeable(path1):
+            os.symlink(path, "." + path1)
+
+    def rename(self, path, path1):
+        path, is_output = self.remap(path)
+        path1, is_output1 = self.remap(path1)
+        logger.debug(f"rename {path} {path1}")
+        if self.is_writeable(path) and self.is_writeable(path1):
+            os.rename("." + path, "." + path1)
+
+    def link(self, path, path1):
+        path, is_output = self.remap(path)
+        path1, is_output1 = self.remap(path1)
+        logger.debug(f"link {path} {path1}")
+        if self.is_writeable(path1):
+            os.link("." + path, "." + path1)
+
+    def chmod(self, path, mode):
+        path, is_output = self.remap(path)
+        logger.debug(f"rename {path} {mode}")
+        if self.is_writeable(path):
+            os.chmod("." + path, mode)
+
+    def chown(self, path, user, group):
+        path, is_output = self.remap(path)
+        logger.debug(f"chown {path} {user} {group}")
+        if self.is_writeable(path):
+            os.chown("." + path, user, group)
+
+    def truncate(self, path, len):
+        path, is_output = self.remap(path)
+        logger.debug(f"truncate {path} {len}")
+        if self.is_writeable(path):
+            f = open("." + path, "a")
+            f.truncate(len)
+            f.close()
+
+    def mknod(self, path, mode, dev):
+        path, is_output = self.remap(path)
+        logger.debug(f"mknod {path} {mode} {dev}")
+        if self.is_writeable(path):
+            os.mknod("." + path, mode, dev)
+
+    def mkdir(self, path, mode):
+        path, is_output = self.remap(path)
+        logger.debug(f"mkdir {path} {mode}")
+        if self.is_writeable(path):
+            os.mkdir("." + path, mode)
+
+    def utime(self, path, times):
+        path, is_output = self.remap(path)
+        logger.debug(f"utime {path} {times}")
+        if self.is_writeable(path):
+            os.utime("." + path, times)
+
+    #    The following utimens method would do the same as the above utime method.
+    #    We can't make it better though as the Python stdlib doesn't know of
+    #    sub-second preciseness in access/modify times.
+    #
+    #    def utimens(self, path, ts_acc, ts_mod):
+    #      os.utime("." + path, (ts_acc.tv_sec, ts_mod.tv_sec))
+
+    def access(self, path, mode):
+        path, is_output = self.common_handle_path(path)
+        os_res = os.access("." + path, mode)
+        if not self.is_writeable(path):
+            self.access_recorder.record_access(path, mode, os_res)
+        if not os_res or (mode == os.W_OK and not self.is_writeable(path)):
+            res = -EACCES
+        else:
+            res = 0
+        logger.debug(f"access {path} {mode}: {os_res} {res}")
+        return res
+
+    #    This is how we could add stub extended attribute handlers...
+    #    (We can't have ones which aptly delegate requests to the underlying fs
+    #    because Python lacks a standard xattr interface.)
+    #
+    #    def getxattr(self, path, name, size):
+    #        val = name.swapcase() + '@' + path
+    #        if size == 0:
+    #            # We are asked for size of the value.
+    #            return len(val)
+    #        return val
+    #
+    #    def listxattr(self, path, size):
+    #        # We use the "user" namespace to please XFS utils
+    #        aa = ["user." + a for a in ("foo", "bar")]
+    #        if size == 0:
+    #            # We are asked for size of the attr list, i.e. joint size of attrs
+    #            # plus null separators.
+    #            return len("".join(aa)) + len(aa)
+    #        return aa
+
+    def statfs(self):
+        """
+        Should return an object with statvfs attributes (f_bsize, f_frsize...).
+        Eg., the return value of os.statvfs() is such a thing (since py 2.2).
+        If you are not reusing an existing statvfs object, start with
+        fuse.StatVFS(), and define the attributes.
+
+        To provide usable information (i.e., you want sensible df(1)
+        output, you are suggested to specify the following attributes:
+
+            - f_bsize - preferred size of file blocks, in bytes
+            - f_frsize - fundamental size of file blcoks, in bytes
+                [if you have no idea, use the same as blocksize]
+            - f_blocks - total number of blocks in the filesystem
+            - f_bfree - number of free blocks
+            - f_files - total number of file inodes
+            - f_ffree - nunber of free file inodes
+        """
+
+        return os.statvfs(".")
+
+    def fsinit(self):
+        os.chdir(self.root)
+
+    def main(self_outer):
+        class BasicFile(object):
+            def __init__(self, path_in, flags, *mode):
+                write_flags = (
+                    os.O_WRONLY
+                    | os.O_RDWR
+                    | os.O_APPEND
+                    | os.O_CREAT
+                    | os.O_TRUNC
+                    | os.O_FSYNC
+                )
+
+                self.path, is_output = self_outer.common_handle_path(path_in)
+                self.writeable = self_outer.is_writeable(self.path)
+                if not self.writeable and (flags & write_flags) != 0:
+                    logger.warning(f"Refuse opening file for write at {self.path=}")
+                    flags &= ~(write_flags)
+
+                if not self.writeable:
+                    self_outer.access_recorder.record_read(self.path)
+                logger.debug(f"Open {self.path=} {flags=} {mode=} {flag2mode(flags)=}")
+                self.file = os.fdopen(
+                    os.open("." + self.path, flags, *mode), flag2mode(flags)
+                )
+                self.fd = self.file.fileno()
+                if hasattr(os, "pread"):
+                    self.iolock = None
+                else:
+                    self.iolock = Lock()
+
+            def read(self, length, offset):
+                if self.iolock:
+                    self.iolock.acquire()
+                    try:
+                        self.file.seek(offset)
+                        return self.file.read(length)
+                    finally:
+                        self.iolock.release()
+                else:
+                    return os.pread(self.fd, length, offset)
+
+            def write(self, buf, offset):
+                if not self_outer.is_writeable(self.path):
+                    return -EACCES
+
+                logger.debug(f"write {self.path} {offset=} {len(buf)=}")
+                if self.iolock:
+                    self.iolock.acquire()
+                    try:
+                        self.file.seek(offset)
+                        self.file.write(buf)
+                        return len(buf)
+                    finally:
+                        self.iolock.release()
+                else:
+                    return os.pwrite(self.fd, buf, offset)
+
+            def release(self, flags):
+                self.file.close()
+
+            def _fflush(self):
+                logger.debug(f"_fflush {self.path=} {self.file.mode=}")
+                if (
+                    "w" in self.file.mode or "a" in self.file.mode
+                ) and self_outer.is_writeable(self.path):
+                    self.file.flush()
+
+            def fsync(self, isfsyncfile):
+                if not self_outer.is_writeable(self.path):
+                    return -EACCES
+
+                self._fflush()
+                if isfsyncfile and hasattr(os, "fdatasync"):
+                    os.fdatasync(self.fd)
+                else:
+                    os.fsync(self.fd)
+
+            def flush(self):
+                self._fflush()
+                # cf. xmp_flush() in fusexmp_fh.c
+                os.close(os.dup(self.fd))
+
+            def fgetattr(self):
+                return os.fstat(self.fd)
+
+            def ftruncate(self, len):
+                logger.debug("ftruncate {self.path=} {len=}")
+                if not self_outer.is_writeable(self.path):
+                    return -EACCES
+
+                self.file.truncate(len)
+
+            def lock(self, cmd, owner, **kw):
+                # The code here is much rather just a demonstration of the locking
+                # API than something which actually was seen to be useful.
+
+                # Advisory file locking is pretty messy in Unix, and the Python
+                # interface to this doesn't make it better.
+                # We can't do fcntl(2)/F_GETLK from Python in a platfrom independent
+                # way. The following implementation *might* work under Linux.
+                #
+                # if cmd == fcntl.F_GETLK:
+                #     import struct
+                #
+                #     lockdata = struct.pack('hhQQi', kw['l_type'], os.SEEK_SET,
+                #                            kw['l_start'], kw['l_len'], kw['l_pid'])
+                #     ld2 = fcntl.fcntl(self.fd, fcntl.F_GETLK, lockdata)
+                #     flockfields = ('l_type', 'l_whence', 'l_start', 'l_len', 'l_pid')
+                #     uld2 = struct.unpack('hhQQi', ld2)
+                #     res = {}
+                #     for i in xrange(len(uld2)):
+                #          res[flockfields[i]] = uld2[i]
+                #
+                #     return fuse.Flock(**res)
+
+                # Convert fcntl-ish lock parameters to Python's weird
+                # lockf(3)/flock(2) medley locking API...
+                op = {
+                    fcntl.F_UNLCK: fcntl.LOCK_UN,
+                    fcntl.F_RDLCK: fcntl.LOCK_SH,
+                    fcntl.F_WRLCK: fcntl.LOCK_EX,
+                }[kw["l_type"]]
+                if cmd == fcntl.F_GETLK:
+                    return -EOPNOTSUPP
+                elif cmd == fcntl.F_SETLK:
+                    if op != fcntl.LOCK_UN:
+                        op |= fcntl.LOCK_NB
+                    elif cmd == fcntl.F_SETLKW:
+                        pass
+                    else:
+                        return -EINVAL
+
+                fcntl.lockf(self.fd, op, kw["l_start"], kw["l_len"])
+
+        self_outer.file_class = BasicFile
+        assert not self_outer.mountpoint.is_mount()
+        assert self_outer.mountpoint.is_dir()
+        assert len(list(self_outer.mountpoint.iterdir())) == 0
+        return Fuse.main(self_outer)
+
+
+def unmount(mountpoint: Path, quite: bool = False) -> bool:
+    cmd = ["fusermount", "-u", str(mountpoint.absolute())]
+    if quite:
+        with open(os.devnull, "w") as f:
+            result = subprocess.run(cmd, stderr=f)
+    else:
+        result = subprocess.run(cmd)
+    logger.info(f"{cmd}: {result=}")
+    return result.returncode == 0
+
+
+class StatusEnum(Enum):
+    REQUIRING = 0
+    CHECKING = 1
+    RUNNING = 2
+    DONE = 3
+    DELETED = 4
+
+
+@dataclass
+class Status:
+    status: StatusEnum
+    waiting_for: list[tuple[(str, str)]]
+    running_pid: Optional[int] = os.getpid()
+
+
+def action_dir(label: ActionLabel):
+    return Path(action_folder_root_str + str(label[0])) / label[1]
+
+
+def output_dir(label: ActionLabel):
+    return Path(output_folder_root_str + str(label[0])) / label[1]
+
+
+def merge_access_logs(label: ActionLabel):
+    action_dir_ = action_dir(label)
+    access_log = access_log_file(label)
+    new_access_log = new_access_log_file(label)
+    if new_access_log.exists():
+        if access_log.exists():
+            tmp_access_log = action_dir_ / "tmp_action_log.json"
+            ret = subprocess.run(
+                f"cat {access_log} {new_access_log} | sort -u > {tmp_access_log}",
+                shell=True,
+            )
+            assert ret.returncode == 0
+            tmp_access_log.rename(access_log)
+            new_access_log.unlink()
+        else:
+            new_access_log.rename(access_log)
+
+
+class BasicAction(object):
+    def __init__(self, directory: Path, name: str, action: Action):
+        self.action_setup_record = ActionSetupRecorder(action, os_environ())
+        self.directory = directory.absolute()
+        self.name = name
+        self.full_path = self.directory / name
+        logger.debug(f"{self.full_path=}")
+        self.storage = fusebuild_folder / ("actions" + str(self.full_path))
+        logger.debug(f"{self.storage=}")
+        self.incremental = False
+        self.building = True
+        self.build_process: psutil.Popen | None = None
+        self.fuse_mount: psutil.Popen | None = None
+
+    def output_folder(self) -> Path:
+        return Path(output_folder_root_str + str(self.full_path))
+
+    @property
+    def label(self):
+        return (self.directory, self.name)
+
+    @property
+    def action(self):
+        return self.action_setup_record.definition
+
+    @property
+    def cmd(self) -> list[str]:
+        return self.action.cmd
+
+    def clean(self) -> None:
+        output = self.output_folder()
+        if output.exists():
+            shutil.rmtree(output)
+
+    def mark_as_done(self, retcode: int) -> None:
+        if retcode == 0:
+            dependencies_ok[self.label] = True
+        if FUSEBUILD_INVOCATION_DIR in os.environ:
+            done_file = Path(
+                os.environ[FUSEBUILD_INVOCATION_DIR]
+                + ("/ok/" if retcode == 0 else "/failed/")
+                + str(self.full_path)
+            )
+            done_file.parent.mkdir(parents=True, exist_ok=True)
+            with done_file.open("w") as f:
+                f.write(f"{retcode}\n")
+
+    def run(self) -> int | None:
+        self.status = StatusEnum.RUNNING
+        self.write_status()
+
+        (action_dir(self.label) / "subbbuild_faild").unlink(missing_ok=True)
+
+        mountpoint = self.storage / "mountpoint"
+        logger.info(f"{mountpoint=}")
+        try:
+            unmount(mountpoint, quite=True)  # Expect unmount to fail
+            mountpoint.mkdir(parents=True, exist_ok=True)
+        except:
+            unmount(mountpoint)
+            mountpoint.mkdir(parents=True, exist_ok=True)
+
+        writeable = self.output_folder()
+        logger.debug(f"{writeable=}")
+        writeable.mkdir(parents=True, exist_ok=True)
+        cwd = self.directory.absolute()
+        (action_dir(self.label) / "subbuild_faild").unlink(missing_ok=True)
+        if len(list(mountpoint.iterdir())) > 0:
+            logger.error(f"{mountpoint} not empty:  {list(mountpoint.iterdir())=}")
+            assert False
+
+        mount_cmd = [
+            "python3",
+            "-m",
+            "fusebuild.core.mountview",
+            str(self.directory.absolute()),
+            self.name,
+        ]
+        logger.debug(f"Mount {mount_cmd=} {os.environ=}")
+        self.fuse_mount = psutil.Popen(
+            mount_cmd,
+            env=os.environ,
+        )
+        logger.debug(f"Mountview for {self.label} is pid={self.fuse_mount.pid}")
+        outer_cwd = Path(str(mountpoint) + "/" + str(cwd))
+        logger.debug(f"Waiting for mount {mountpoint} at {cwd} by testing {outer_cwd}")
+        while True:
+            if outer_cwd.exists():
+                break
+            try:
+                self.fuse_mount.wait(0.01)
+                logger.error(
+                    f"Mount on {mountpoint=} before build process started {self.fuse_mount.returncode=}"
+                )
+                return -1
+            except psutil.TimeoutExpired:
+                pass
+
+        logger.debug("Mount complete")
+        try:
+            logger.debug(f"Start {self.cmd} in {cwd}")
+            env = os.environ.copy()
+            output_dir_full_path = str(self.output_folder().absolute())
+            logger.debug(f"{output_dir_full_path=}")
+            env["OUTPUT_DIR"] = output_dir_full_path
+            match self.action.tmp:
+                case TmpDir(p):
+                    env["TMPDIR"] = p
+                case RandomTmpDir():
+                    env["TMPDIR"] = tempfile.mkdtemp()
+                case None:
+                    if "TMPDIR" in env:
+                        env.pop("TMPDIR")
+                case _:
+                    assert False
+
+            spawn_cmd, spawn_env = self.action.sandbox.generate_command(
+                mountpoint, cwd, self.cmd, env
+            )
+
+            try:
+
+                logger.info(f"{spawn_cmd=}  {spawn_env=}")
+                self.build_process = psutil.Popen(spawn_cmd, env=spawn_env)
+                logger.debug(
+                    f"Build process for {self.label} is {self.build_process.pid=}"
+                )
+                assert self.build_process is not None
+                subbuild_failed = False
+                subbuild_failed_file = action_dir(self.label) / "subbuild_faild"
+                while True:
+                    logger.debug(
+                        f"Waiting for cmd for {self.label} to finish {self.build_process.pid=}"
+                    )
+                    procs = [
+                        self.build_process,
+                        self.fuse_mount,
+                    ]
+                    gone, alive = psutil.wait_procs(procs, timeout=1.0)
+                    if self.build_process in gone:
+                        self.action_setup_record.return_code = (
+                            self.build_process.returncode
+                        )
+                        logger.info(
+                            f"Running command for {self.label} finished {self.action_setup_record.return_code=}"
+                        )
+                        self.build_process = None
+                        break
+                    if self.fuse_mount in gone:
+                        logger.error(
+                            f"Fuse mount exited too early with return code {self.fuse_mount.returncode}"
+                        )
+                        self.action_setup_record.return_code = -1
+                        self.fuse_mount = None
+                        kill_subprocess(self.build_process)
+                        break
+                    subbuild_failed = subbuild_failed_file.exists()
+                    if subbuild_failed and self.build_process is not None:
+                        logger.info(
+                            f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}"
+                        )
+                        kill_subprocess(self.build_process)
+                    if subbuild_failed and self.action_setup_record.return_code is None:
+                        logger.info(
+                            f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}, setting return code to -1"
+                        )
+
+                        self.action_setup_record.return_code = -1
+            except Exception as e:
+                logger.error(
+                    f"Something went wrong when spawning {self.directory} / {self.name}: {e=}"
+                )
+                if self.build_process is not None:
+                    kill_subprocess(self.build_process)
+                if self.fuse_mount is not None:
+                    unmount(mountpoint)
+                    kill_subprocess(self.fuse_mount)
+                    assert len(list(mountpoint.iterdir())) == 0
+                raise
+
+            logger.debug(f"{self.cmd} done: {self.action_setup_record.return_code}")
+
+            logger.debug(
+                f"Checking {subbuild_failed_file=}: {subbuild_failed_file.exists()}"
+            )
+            subbuild_failed = subbuild_failed_file.exists()
+            if subbuild_failed:
+                logger.info("Return code == 0 but subbuild failed")
+                self.action_setup_record.return_code = -1
+                failed_action = subbuild_failed_file.read_text().strip()
+
+                print(
+                    f"{self.label} failed because {failed_action} failed",
+                    file=sys.stderr,
+                )
+
+            assert self.action_setup_record.return_code is not None
+            self.mark_as_done(self.action_setup_record.return_code)
+            return self.action_setup_record.return_code
+        finally:
+            logger.debug(f"Finally {mountpoint}")
+            while self.fuse_mount is not None:
+                if not unmount(mountpoint):
+                    logger.error(f"Failed to unmount {mountpoint}")
+                else:
+                    logger.debug(f"Called unmount")
+                    assert len(list(mountpoint.iterdir())) == 0
+
+                try:
+                    self.fuse_mount.wait(1.0)
+                    logger.debug("Fuse mount stopped")
+                    fuse_return_code = self.fuse_mount.returncode
+                    if fuse_return_code != 0:
+                        logger.error(
+                            f"Fuse mount didn't return ok: {fuse_return_code=}"
+                        )
+                        self.action_setup_record.return_code = -1
+                    self.fuse_mount = None
+                except psutil.TimeoutExpired:
+                    logger.debug("Timeput while waiting for fuse mount to stop")
+                    pass
+
+            logger.debug(f"Joined")
+            assert len(list(mountpoint.iterdir())) == 0
+            merge_access_logs((self.directory, self.name))
+            with self.last_definition().open("w") as f:
+                first_line = self.action_setup_record
+                schema = class_schema(ActionSetupRecorder)()
+                first_dict = schema.dump(first_line)
+                f.write(json.dumps(first_dict) + "\n")
+
+            self.release_lock()
+
+    def release_lock(self) -> None:
+        self.status = StatusEnum.DONE
+        self.write_status()
+
+    def _read_status(self) -> Optional[Status]:
+        status_file = self.storage / "status.json"
+        if not status_file.exists():
+            return None
+
+        schema = marshmallow_dataclass2.class_schema(Status)()
+        with (status_file).open("r") as f:
+            d = json.load(f)
+            return schema.load(d)
+
+    def get_status_lock_file(self) -> FileLock:
+        return FileLock(str(self.storage / "status.lck"))
+
+    def require_for_build(self) -> tuple[bool, Status]:
+        with self.get_status_lock_file() as lock:
+            status = self._read_status()
+            logger.debug(f"Status for {self.full_path} was {status}")
+            if not status or status.status == StatusEnum.DONE:
+                status = Status(StatusEnum.REQUIRING, [])
+                self._write_status(status)
+                return True, status
+            else:
+                if check_pid(status.running_pid):
+                    return False, status
+                else:
+                    return True, status
+
+    def _write_status(self, status: Status) -> None:
+        logger.debug(f"Writing status {status}")
+        schema = marshmallow_dataclass2.class_schema(Status)()
+        status_json = json.dumps(schema.dump(status))
+
+        status_file = self.storage / "status.json"
+        logger.debug(f"Writing status {status_json} to {status_file}")
+        try:
+            with status_file.open("w") as f:
+                f.write(status_json)
+        except Exception as e:
+            logger.error(f"Can't write {status_file}: {e}")
+            raise e
+
+    def write_status(self) -> None:
+        with self.get_status_lock_file() as lock:
+            status = Status(
+                self.status,
+                [],
+                running_pid=os.getpid(),
+            )
+            self._write_status(status)
+
+    def handle_status_change(self) -> None:
+        self.write_status()
+        logger.debug(
+            f"handle_status_change {self.fuse_mount=} and {self.build_process=}"
+        )
+
+    def last_definition(self) -> Path:
+        return self.storage / "last_definition.json"
+
+    def needs_rebuild(self, reason: str) -> bool:
+        if (self.directory, self.name) in dependencies_ok:
+            logger.debug(f"({self.directory}, {self.name}) in dependencies_ok")
+            return False
+        if FUSEBUILD_INVOCATION_DIR in os.environ:
+            if Path(
+                os.environ[FUSEBUILD_INVOCATION_DIR]
+                + "/ok/"
+                + str(self.directory)
+                + "/"
+                + self.name
+            ).exists():
+                logger.debug(f"({self.directory}, {self.name}) in invocation dir")
+                dependencies_ok[(self.directory, self.name)] = True
+                return False
+
+        count = 0
+        while True:
+            count += 1
+            required, status = self.require_for_build()
+            if required:
+                break
+            if count > 1:
+                print(f"Waiting for {self.label} for {reason}")
+                logger.error(
+                    f"Couldn't require {self.label} for {reason} for build: {status=} deadlock?"
+                )
+                traceback.print_stack()
+            else:
+                logger.debug(
+                    f"Couldn't require {self.label} for build: {status=} {count=}"
+                )
+            time.sleep(1.0)
+
+        self.status = StatusEnum.CHECKING
+        self.write_status()
+        merge_access_logs(self.label)
+        dependency_log = self.last_definition()
+        action_setup_record_old: ActionSetupRecorder | None = None
+        if dependency_log.exists():
+            fail = False
+            action_setup_schema = class_schema(ActionSetupRecorder)()
+            try:
+                with dependency_log.open("r") as f:
+                    line = f.readline()
+                    logger.debug(f"{line=}")
+                    action_setup_record_old = action_setup_schema.load(json.loads(line))
+            except Exception as e:
+                logger.error(f"Error while loading old access log: {e}")
+                print("Failed to load previous dependencies")
+                traceback.print_exc()
+                fail = True
+        else:
+            print("Not build before")
+            logger.info(f"{dependency_log} doesn't exist")
+
+        if action_setup_record_old is None:
+            logger.debug("Starting a new AccessRecorder")
+            matches = False
+        else:
+            if (
+                action_setup_record_old.definition
+                != self.action_setup_record.definition
+            ):
+                print(f"{self.directory} / {self.name}: Action changed")
+                matches = False
+            else:
+                matches = check_accesses(self.label)
+
+        if action_setup_record_old is None:
+            return True
+        elif matches and action_setup_record_old.return_code == 0:
+            self.mark_as_done(0)
+            return False
+        else:
+            return True
+
+    def run_if_needed(self, reason: str) -> int | None:
+        needs_rebuild = self.needs_rebuild(reason)
+        if not needs_rebuild:
+            return 0
+        elif (
+            FUSEBUILD_INVOCATION_DIR in os.environ
+            and (
+                failed_file := Path(
+                    os.environ[FUSEBUILD_INVOCATION_DIR]
+                    + "/failed/"
+                    + str(self.full_path)
+                )
+            ).exists()
+        ):
+            retcode = int(failed_file.read_text())
+            logger.info(f"{self.label} failed with {retcode=}")
+            return retcode
+        elif self.incremental:
+            logger.info(f"Incremantal - run {self.full_path} again without cleaning")
+            return self.run()
+        else:
+            logger.info(f"Clean and run {self.full_path} again")
+            self.last_definition().unlink(missing_ok=True)
+            self.clean()
+            access_log_file(self.label).unlink(missing_ok=True)
+            new_access_log_file(self.label).unlink(missing_ok=True)
+            action_deps_file(self.label).unlink(missing_ok=True)
+            return self.run()
+
+
+class LoadBuildFileAction(BasicAction):
+    def __init__(self, buildfile: Path) -> None:
+        buildfile = buildfile.absolute()
+        cmd = [
+            "python",
+            "-m",
+            "fusebuild.core.load_build_file",
+            str(buildfile),
+        ]
+
+        self.buildfile = buildfile
+        super(LoadBuildFileAction, self).__init__(
+            buildfile.parent, "FUSEBUILD.py", Action(cmd, category="", tmp=RandomTmpDir())
+        )
+
+    def clean(self) -> None:
+        output = self.output_folder()
+        for action_file in output.glob("*.json"):
+            action_file.unlink()
+
+        schema = marshmallow_dataclass2.class_schema(Action)()
+        output.mkdir(exist_ok=True, parents=True)
+        action_def = output / (self.buildfile.name + ".json")
+        logger.debug(f"Writing {action_def}")
+        with action_def.open("w") as f:
+            json.dump(schema.dump(self.action), f)
+
+
+class RuleAction(BasicAction):
+    def __init__(self, path: Path, name: str, action: Action) -> None:
+        super(RuleAction, self).__init__(path, name, action)
+
+
+def clean_nonexisting_action(path: Path, name: str):
+    logger.info(f"Clean non-exsisting target {path}/{name}")
+    empty_action = Action(cmd=[], category="internal_clean")
+    action = RuleAction(path, name, empty_action)
+    action.require_for_build()
+    action.clean()
+    action.status = StatusEnum.DELETED
+    action.write_status()
+
+
+visited_directories: set[Path] = set([])
+loaded_actions: dict[tuple[Path, str], Action] = {}
+
+
+def all_actions() -> Iterable[tuple[Path, str]]:
+    return loaded_actions.keys()
+
+
+action_schema = marshmallow_dataclass2.class_schema(Action)()
+
+
+def load_action_file(label: ActionLabel, action_file: Path) -> Action:
+    logger.debug(f"Loading action {label} from {action_file}")
+    with action_file.open("r") as f:
+        d = json.load(f)
+        action = action_schema.load(d)
+        for provider in action.providers.values():
+            provider.output_dir = (
+                Path(output_folder_root_str + str(label[0])) / label[1]
+            )
+
+    logger.debug(f"Got action {action_file}: {action}")
+    return action
+
+
+def load_actions(path: Path) -> dict[ActionLabel, Action]:
+    logger.debug(f"load_actions({path})")
+    logger.debug(f"Looking for actions in {output_folder_root} / {str(path)}")
+    actions = {}
+    for action_file in (Path(output_folder_root_str + str(path)) / "FUSEBUILD.py").glob(
+        "*.json"
+    ):
+        name = action_file.name.removesuffix(".json")
+        label = (path, name)
+        action = load_action_file(label, action_file)
+        loaded_actions[label] = action
+        actions[label] = action
+
+    visited_directories.add(path)
+    return actions
+
+
+def check_build_file(
+    buildfile: Path, reason: str
+) -> Result[dict[ActionLabel, Action], int | None]:
+    logger.debug(f"check_build_file({buildfile})")
+    buildfile = buildfile.absolute()
+    if not buildfile.exists():
+        return Err(None)
+    action = LoadBuildFileAction(buildfile)
+    ret = action.run_if_needed(reason)
+    if ret is not None:
+        action.release_lock()
+    logger.debug(f"LoadBuildFileAction({buildfile}) {ret=}")
+    if ret != 0 and ret is not None:
+        return Err(ret)
+
+    return Ok(load_actions(buildfile.parent))
+
+
+def get_action(path: Path | str, action: str) -> Action | None | int:
+    logger.debug(f"get_action({path}, {action})")
+    if isinstance(path, str):
+        path = Path(path)
+    path = path.absolute()
+    if path.is_file():
+        path = path.parent
+
+    if (path, action) in loaded_actions:
+        return loaded_actions[(path, action)]
+
+    if path in visited_directories:
+        # SBUILD file load and actions are up-to-date, but no such action
+        return None
+
+    res = check_build_file(path / "FUSEBUILD.py", str((path, action)))
+    match res:
+        case Err(ret):
+            logger.warning(f"Failed to load {path / 'FUSEBUILD.py'}: Returned {ret}")
+            return ret
+        case Ok(actions):
+            pass
+
+    if (path, action) not in loaded_actions:
+        logger.info(f"{path}/{action} not defined {loaded_actions=}")
+        return None
+
+    return loaded_actions[(path, action)]
+
+
+def get_rule_action(p: Path, name: str) -> RuleAction | None:
+    action = get_action(p, name)
+    logger.debug(f"get_rule_action({p}, {name}) = {action}")
+    match action:
+        case None:
+            return None
+        case int(res):
+            return None
+        case _:
+            return RuleAction(p, name, action)
+
+
+def get_action_from_path(t: Path) -> tuple[ActionLabel, Action] | None:
+    t = t.absolute()
+    while True:
+        name = t.name
+        t = t.parent
+        logger.debug(f"{t=} {name=}")
+        build_file = t / "FUSEBUILD.py"
+        if build_file.exists():
+            action = get_action(t, name)
+            logger.debug(f"get_action({t}, {name}) returned {action=}")
+            if isinstance(action, Action):
+                return ((t, name), action)
+            else:
+                return None
+
+        if t == Path(".") or t == Path("/"):
+            break
+
+    return None
+
+
+def find_all_actions(d: Path) -> Result[dict[ActionLabel, Action], set[Path]]:
+    fails: set[Path] = set([])
+    actions: dict[ActionLabel, Action] = {}
+    build_files = d.glob("**/FUSEBUILD.py")
+    for bf in build_files:
+        res = check_build_file(bf, f"finding all actions in {d}")
+        match res:
+            case Err(ret):
+                logger.error(f"Failed to load {bf}: Returned {ret}")
+                fails.add(bf)
+            case Ok(acts):
+                actions.update(acts)
+
+    if len(fails) > 0:
+        return Err(fails)
+    else:
+        return Ok(actions)
+
+
+def label_from_line(line: str):
+    """Assumes action names doesn't contain / - might change"""
+    last_slash = line.rfind("/")
+    return (Path(line[0:last_slash]), line[last_slash + 1 :].rstrip())
+
+
+def action_deps_file(label: ActionLabel) -> Path:
+    return action_dir(label) / "action_deps.txt"
+
+
+def load_action_deps(label: ActionLabel | Path) -> list[ActionLabel]:
+    if isinstance(label, Path):
+        txt_file = label
+    else:
+        txt_file = action_deps_file(label)
+
+    if txt_file.exists():
+        with txt_file.open("r") as f:
+            return [label_from_line(line) for line in f.readlines()]
+    else:
+        return []
