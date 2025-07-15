@@ -127,10 +127,7 @@ def kill_process(process: psutil.Process, signal: int, tmp_dir: str):
     try:
         env = process.environ()
 
-        if (
-            FUSEBUILD_INVOCATION_DIR in env
-            and env[FUSEBUILD_INVOCATION_DIR] == tmp_dir
-        ):
+        if FUSEBUILD_INVOCATION_DIR in env and env[FUSEBUILD_INVOCATION_DIR] == tmp_dir:
             logger.info(f"Killing {process.pid} with {FUSEBUILD_INVOCATION_DIR}")
         else:
             logger.info(f"Killing {process.pid} with {FUSEBUILD_INVOCATION_DIR}")
