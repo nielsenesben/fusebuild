@@ -36,13 +36,13 @@ There is no central deamon running the system as with Bazel and Graddle. All is 
 
 ## Command line ##
 
-Right now there is a 
+Right now there is a
 > fusebuild.sh <catagories\> <actions | directories\>+
 
-to get the list of actions or all actions in the directory(ies) invoked, if they have match the category. A action has the form 
+to get the list of actions or all actions in the directory(ies) invoked, if they have match the category. A action has the form
 > <path to dir with FUSEBUILD.py\>/<name\>.
 
-By pointing to a directory all FUSEBUILD.py below that directory will be checked and all actions with a matching category will be invoked. 
+By pointing to a directory all FUSEBUILD.py below that directory will be checked and all actions with a matching category will be invoked.
 
 > fusebuild.sh build,test .
 

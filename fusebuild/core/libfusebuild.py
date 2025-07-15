@@ -1345,7 +1345,9 @@ class LoadBuildFileAction(BasicAction):
 
         self.buildfile = buildfile
         super(LoadBuildFileAction, self).__init__(
-            buildfile.parent, "FUSEBUILD.py", Action(cmd, category="", tmp=RandomTmpDir())
+            buildfile.parent,
+            "FUSEBUILD.py",
+            Action(cmd, category="", tmp=RandomTmpDir()),
         )
 
     def clean(self) -> None:
