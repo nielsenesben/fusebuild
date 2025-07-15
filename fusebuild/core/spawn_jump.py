@@ -1,7 +1,7 @@
 import subprocess
 import sys
 import os
-from logger import getLogger
+from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)
 # logging.basicConfig(level=logging.DEBUG)
