@@ -15,6 +15,7 @@ from pathlib import Path
 import psutil
 from result import Err, Ok
 
+from .access_recorder import load_action_deps
 from .action import Action, ActionLabel
 from .graph import sort_graph
 from .libfusebuild import (
@@ -25,7 +26,6 @@ from .libfusebuild import (
     find_all_actions,
     get_action_from_path,
     get_rule_action,
-    load_action_deps,
     run_action,
 )
 from .logger import FUSEBUILD_LOG_LEVEL, getLogger

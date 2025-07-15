@@ -4,15 +4,10 @@ from pathlib import Path
 
 import marshmallow_dataclass2
 
+from .access_recorder import AccessRecorder, new_access_log_file
 from .action import Action, ActionLabel
-from .libfusebuild import (
-    AccessRecorder,
-    BasicMount,
-    action_dir,
-    action_folder_root_str,
-    new_access_log_file,
-    output_folder_root_str,
-)
+from .file_layout import action_dir, action_folder_root_str, output_folder_root_str
+from .libfusebuild import BasicMount, check_build_target
 from .logger import getLogger
 
 logger = getLogger(__name__)

@@ -6,12 +6,8 @@ from pathlib import Path
 import marshmallow_dataclass2
 
 from .action import Action, BwrapSandbox, TmpDir, TmpStrategy
-from .libfusebuild import (
-    load_action_file,
-    loaded_actions,
-    output_dir,
-    output_folder_root_str,
-)
+from .file_layout import output_dir, output_folder_root_str
+from .libfusebuild import load_action_file, loaded_actions
 from .logger import getLogger
 
 logger = getLogger(__name__)

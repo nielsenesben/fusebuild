@@ -1,7 +1,7 @@
 import functools
 from pathlib import Path
 
-from fusebuild.core.libfusebuild import output_folder_root_str
+from fusebuild.core.file_layout import output_folder_root_str
 
 
 @functools.cache

@@ -8,7 +8,9 @@ from pathlib import Path
 from absl.testing.absltest import TestCase, main  # type: ignore
 
 from fusebuild import output_folder_root
-from fusebuild.core.libfusebuild import load_action_deps
+
+# Load internal stuff to test internal state
+from fusebuild.core.access_recorder import load_action_deps
 from fusebuild.core.logger import getLogger
 
 # logging.basicConfig(level=logging.DEBUG)
