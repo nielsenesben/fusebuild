@@ -3,9 +3,9 @@ import os
 import importlib.util
 import time
 from pathlib import Path
-from libfusebuild import get_rule_action, Status
+from fusebuild.core.libfusebuild import get_rule_action, Status
 import uuid
-from logger import getLogger
+from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)
 # logging.basicConfig(level=logging.DEBUG)
