@@ -1,16 +1,18 @@
-from .libfusebuild import (
-    BasicMount,
-    action_folder_root_str,
-    AccessRecorder,
-    output_folder_root_str,
-    new_access_log_file,
-    action_dir,
-)
-from .action import Action, ActionLabel
-from pathlib import Path
-import marshmallow_dataclass2
 import json
 import sys
+from pathlib import Path
+
+import marshmallow_dataclass2
+
+from .action import Action, ActionLabel
+from .libfusebuild import (
+    AccessRecorder,
+    BasicMount,
+    action_dir,
+    action_folder_root_str,
+    new_access_log_file,
+    output_folder_root_str,
+)
 from .logger import getLogger
 
 logger = getLogger(__name__)

@@ -1,4 +1,5 @@
-from absl.testing.absltest import main, TestCase  # type: ignore
+from absl.testing.absltest import TestCase, main  # type: ignore
+
 from fusebuild.core.graph import sort_graph
 
 

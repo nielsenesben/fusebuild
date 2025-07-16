@@ -1,16 +1,18 @@
-from absl.testing.absltest import main, TestCase  # type: ignore
+import os
+import shutil
+import socket
+import subprocess
 import tempfile
 from pathlib import Path
-import shutil
-import subprocess
-import os
-import socket
+
+from absl.testing.absltest import TestCase, main  # type: ignore
+
 from fusebuild import output_folder_root
 from fusebuild.core.libfusebuild import load_action_deps
+from fusebuild.core.logger import getLogger
 
 # logging.basicConfig(level=logging.DEBUG)
 
-from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)
 

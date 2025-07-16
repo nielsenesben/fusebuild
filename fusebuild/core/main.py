@@ -2,35 +2,33 @@ import logging
 
 logging.basicConfig(format="%(process)d %(filename)s %(lineno)d: %(message)s")
 
-import sys
-import time
+import argparse
 import inspect
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
+
+import psutil
+from result import Err, Ok
+
+from .action import Action, ActionLabel
+from .graph import sort_graph
 from .libfusebuild import (
-    BasicAction,
     FUSEBUILD_INVOCATION_DIR,
+    BasicAction,
     all_actions,
     check_build_file,
-)
-from .action import Action, ActionLabel
-from .libfusebuild import (
-    get_rule_action,
     find_all_actions,
-    run_action,
     get_action_from_path,
+    get_rule_action,
     load_action_deps,
+    run_action,
 )
-from result import Ok, Err
-import tempfile
-import os
-import subprocess
-import psutil
-import signal
-import time
-import argparse
-from .graph import sort_graph
-
-from .logger import getLogger, FUSEBUILD_LOG_LEVEL
+from .logger import FUSEBUILD_LOG_LEVEL, getLogger
 
 logger = getLogger(__name__)
 

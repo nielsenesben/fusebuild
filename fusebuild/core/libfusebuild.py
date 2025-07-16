@@ -11,55 +11,55 @@
 
 from __future__ import print_function
 
-from abc import ABC, abstractmethod
-import os, sys, signal
-import json
-import tempfile
-from errno import *
-from stat import *
 import fcntl
-import time
-from pathlib import Path
-from threading import Lock
-import threading
 import hashlib
-import subprocess
+import importlib.util
+import json
+import os
 import shutil
-from typing import Any, Optional, Protocol, Iterable
-from dataclasses import dataclass, field
-from io import TextIOWrapper
-from result import Result, Ok, Err
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
 import uuid
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from errno import *
+from io import TextIOWrapper
+from pathlib import Path
+from stat import *
+from threading import Lock, Thread
+from typing import Any, Iterable, Optional, Protocol
+
+import marshmallow_dataclass2
 import psutil
 from filelock import FileLock
-import importlib.util
-import traceback
-from threading import Thread, Lock
+from marshmallow_dataclass2 import class_schema
+from result import Err, Ok, Result
 
 from fusebuild.core.action import (
-    ActionLabel,
     Action,
-    TmpDir,
-    RandomTmpDir,
+    ActionLabel,
     Mapping,
     MappingDefinition,
+    RandomTmpDir,
+    TmpDir,
 )
-
-from enum import Enum
-from marshmallow_dataclass2 import class_schema
 from fusebuild.core.dependency import (
     AccessType,
+    ActionSetupRecorder,
     DependencyIndex,
-    DependencyValue,
     DependencyRecord,
+    DependencyValue,
     StatRecordDir,
     StatRecordFile,
     check_file_hash,
     get_file_hash,
-    ActionSetupRecorder,
 )
-
-import marshmallow_dataclass2
 
 # pull in some spaghetti to make this stuff work without fuse-py being installed
 try:
@@ -68,6 +68,7 @@ except ImportError:
     pass
 import fuse  # type: ignore
 from fuse import Fuse, FuseArgs, FuseError
+
 import fusebuild.core.logger as logger_module
 
 logger = logger_module.getLogger(__name__)

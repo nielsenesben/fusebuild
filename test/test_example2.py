@@ -1,9 +1,11 @@
-from absl.testing.absltest import main, TestCase  # type: ignore
-import tempfile
-from pathlib import Path
+import os
 import shutil
 import subprocess
-import os
+import tempfile
+from pathlib import Path
+
+from absl.testing.absltest import TestCase, main  # type: ignore
+
 from fusebuild import output_folder_root
 from fusebuild.core.logger import getLogger
 

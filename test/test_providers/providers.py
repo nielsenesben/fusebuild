@@ -1,5 +1,6 @@
-from fusebuild import Provider
 from dataclasses import dataclass
+
+from fusebuild import Provider
 
 
 @dataclass

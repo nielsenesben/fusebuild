@@ -1,6 +1,7 @@
-from fusebuild import shell_action, get_action
-from test.test_providers.providers import TestProvider
 from pathlib import Path
+from test.test_providers.providers import TestProvider
+
+from fusebuild import get_action, shell_action
 
 print(f"Loading {__file__}")
 

@@ -1,7 +1,9 @@
-import fusebuild.core.actions as actions
-from pathlib import Path
 import importlib
 import sys
+from pathlib import Path
+
+import fusebuild.core.actions as actions
+
 from .logger import getLogger
 
 logger = getLogger(__name__)

@@ -1,5 +1,6 @@
 import re
 import sys
+
 from fusebuild.core.main import main
 
 if __name__ == "__main__":

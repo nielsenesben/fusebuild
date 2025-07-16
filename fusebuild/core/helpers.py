@@ -1,5 +1,6 @@
-from pathlib import Path
 import functools
+from pathlib import Path
+
 from fusebuild.core.libfusebuild import output_folder_root_str
 
 
