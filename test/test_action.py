@@ -1,7 +1,9 @@
-from absl.testing.absltest import main, TestCase  # type: ignore
-from fusebuild.core.action import Action, PatternRemapToOutput
 import json
+
 import marshmallow_dataclass2
+from absl.testing.absltest import TestCase, main  # type: ignore
+
+from fusebuild.core.action import Action, PatternRemapToOutput
 
 
 class TestExample1(TestCase):

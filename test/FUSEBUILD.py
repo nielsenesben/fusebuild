@@ -1,5 +1,5 @@
-from fusebuild import shell_action, get_action, NoSandbox, BwrapSandbox
-from fusebuild.python import pyc_mappings, pyc_actions
+from fusebuild import BwrapSandbox, NoSandbox, get_action, shell_action
+from fusebuild.python import pyc_actions, pyc_mappings
 
 pyc_actions()
 

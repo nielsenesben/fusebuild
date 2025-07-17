@@ -1,6 +1,7 @@
+import os
 import subprocess
 import sys
-import os
+
 from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)

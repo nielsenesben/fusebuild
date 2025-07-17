@@ -1,10 +1,11 @@
-import sys
-import os
 import importlib.util
+import os
+import sys
 import time
-from pathlib import Path
-from fusebuild.core.libfusebuild import get_rule_action, Status
 import uuid
+from pathlib import Path
+
+from fusebuild.core.libfusebuild import Status, get_rule_action
 from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)

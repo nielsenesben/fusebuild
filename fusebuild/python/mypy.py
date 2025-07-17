@@ -1,6 +1,7 @@
-from fusebuild import shell_action, top_output_dir
-from pathlib import Path
 from glob import glob
+from pathlib import Path
+
+from fusebuild import shell_action, top_output_dir
 from fusebuild.python.pyc import pyc_mappings
 
 

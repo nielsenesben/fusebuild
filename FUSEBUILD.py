@@ -1,6 +1,7 @@
 from glob import glob
-from fusebuild import shell_action, action, NoSandbox
-from fusebuild.python import pyc_mappings, pyc_actions, mypy_actions
+
+from fusebuild import NoSandbox, action, shell_action
+from fusebuild.python import mypy_actions, pyc_actions, pyc_mappings
 
 print(f"Loading {__file__}")
 action(name="xeyes", cmd=["xeyes"], category="demo")

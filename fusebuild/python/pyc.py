@@ -1,6 +1,7 @@
-from fusebuild import topdir, top_output_dir, PatternRemapToOutput, shell_action
-from pathlib import Path
 from glob import glob
+from pathlib import Path
+
+from fusebuild import PatternRemapToOutput, shell_action, top_output_dir, topdir
 
 
 def pyc_actions(t: Path = topdir(Path("."))):

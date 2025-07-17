@@ -1,11 +1,13 @@
-from dataclasses import dataclass, field
-from typing import TypeAlias, Protocol, Any
-from pathlib import Path
-from copy import deepcopy
-from importlib import import_module
-from marshmallow import Schema, fields
 import re
+from copy import deepcopy
+from dataclasses import dataclass, field
+from importlib import import_module
+from pathlib import Path
+from typing import Any, Protocol, TypeAlias
+
 import marshmallow_dataclass2
+from marshmallow import Schema, fields
+
 from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)
