@@ -264,3 +264,9 @@ class Action:
 class ActionStatus:
     success: bool
     rerun: bool
+
+
+def label_from_line(line: str):
+    """Assumes action names doesn't contain / - might change"""
+    last_slash = line.rfind("/")
+    return (Path(line[0:last_slash]), line[last_slash + 1 :].rstrip())
