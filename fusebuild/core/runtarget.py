@@ -19,12 +19,11 @@ def _check_for_deadlock(
     return False
 
 
-def _runtarget(buildfile: Path, target: str) -> int | None:
+def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | None:
     # os.setpgrp()
     logger.debug(f"Runtarget {buildfile=} {target=}")
     assert buildfile.is_file()
     label = (buildfile.parent, target)
-    invoker = ActionBase(label)
     action = get_rule_action(buildfile.parent, target, invoker)
     if action is None:
         return -1
@@ -33,4 +32,9 @@ def _runtarget(buildfile: Path, target: str) -> int | None:
 
 
 if __name__ == "__main__":
-    sys.exit(_runtarget(Path(sys.argv[1]), sys.argv[2]))
+    invoker: ActionInvoker
+    if len(sys.argv) > 3:
+        invoker = ActionBase((Path(sys.argv[3]), sys.argv[4]))
+    else:
+        invoker = DummyInvoker()
+    sys.exit(_runtarget(Path(sys.argv[1]), sys.argv[2], invoker))

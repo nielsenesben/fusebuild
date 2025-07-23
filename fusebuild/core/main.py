@@ -107,12 +107,12 @@ def main_inner(args: list[str]) -> int:
                 continue
 
         print(f"{str(label[0])}/{label[1]}....", end="")
-        needs_rebuild = rule_action.needs_rebuild(invoker, "from main loop")
+        needs_rebuild = rule_action.needs_rebuild("from main loop")
         rule_action.release_lock()
         if not needs_rebuild:
             print(".. Unchanged")
         else:
-            res = run_action(label[0], label[1])
+            res = run_action(label[0], label[1], invoker)
             if res != 0:
                 print(".. failed")
                 if label in targets:

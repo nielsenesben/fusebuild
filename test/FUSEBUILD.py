@@ -73,6 +73,20 @@ shell_action(
     mappings=pyc_mappings(),
 )
 
+shell_action(
+    name="run_test_circular",
+    cmd="\n".join(
+        [
+            ". $OUTPUT_DIR/../../venv/bin/activate",
+            "export FUSEBUILD_CACHE_DIR=$OUTPUT_DIR/fusebuild_cache",
+            "python test_circular.py",
+        ]
+    ),
+    category="test",
+    sandbox=BwrapSandbox(run_as_root=True),
+    mappings=pyc_mappings(),
+)
+
 provider = get_action("./test_providers/", "hasprovider").providers["testprovider"]
 
 shell_action(

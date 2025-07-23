@@ -36,9 +36,9 @@ from threading import Lock, Thread
 from types import TracebackType
 from typing import Any, Iterable, Optional, Protocol
 
+import filelock
 import marshmallow_dataclass2
 import psutil
-from filelock import FileLock
 from marshmallow_dataclass2 import class_schema
 from result import Err, Ok, Result
 
@@ -58,6 +58,7 @@ from fusebuild.core.action import (
     MappingDefinition,
     RandomTmpDir,
     TmpDir,
+    label_from_line,
 )
 from fusebuild.core.dependency import ActionSetupRecorder
 from fusebuild.core.file_layout import (
@@ -154,8 +155,9 @@ def flag2mode(flags):
     return m
 
 
-def run_action(directory: Path, target: str) -> int:
+def run_action(directory: Path, target: str, invoker: ActionInvoker) -> int:
     logger.debug(f"Run action {directory} / {target}")
+    process = None
     try:
         process = psutil.Popen(
             [
@@ -163,7 +165,8 @@ def run_action(directory: Path, target: str) -> int:
                 str(Path(__file__).parent / "runtarget.py"),
                 str(directory.absolute() / "FUSEBUILD.py"),
                 target,
-            ],
+            ]
+            + invoker.runtarget_args(),
             env=os.environ,
         )
         res = process.wait()
@@ -230,7 +233,7 @@ def check_build_target(
             pass
 
     logger.info(f"Dependency {src_dir}/{target}")
-    res = run_action(src_dir, target)
+    res = run_action(src_dir, target, invoker)
     logger.info(f"Dependency {src_dir}/{target} returned {res}")
     if res == 0:
         dependencies_ok[label] = True
@@ -672,12 +675,22 @@ class ActionBase(ActionInvoker):
     def label(self):
         return (self.directory, self.name)
 
-    def write_waiting_for(self):
-        with (self.storage / "waiting_for").open("w") as f:
-            f.writelines([str(l) for l in self._waiting_for])
+    def runtarget_args(self) -> list[str]:
+        return [self.label[0], self.label[1]]
 
-    def get_status_lock_file(self) -> FileLock:
-        return FileLock(str(self.storage / "status.lck"))
+    @property
+    def waiting_for_file(self):
+        return self.storage / "waiting_for"
+
+    def write_waiting_for(self):
+        logger.debug(
+            f"write_waiting_for {self.label} to {self.waiting_for_file}: {self._waiting_for}"
+        )
+        with self.waiting_for_file.open("w") as f:
+            f.writelines([f"{str(l[0])}/{l[1]}" for l in self._waiting_for])
+
+    def get_status_lock_file(self) -> filelock.FileLock:
+        return filelock.FileLock(str(self.storage / "status.lck"))
 
     def waiting_for(self, label: ActionLabel) -> AbstractContextManager:
         class WaitingFor:
@@ -695,7 +708,7 @@ class ActionBase(ActionInvoker):
                 exc_tb: TracebackType | None,
             ) -> None:
                 with self.get_status_lock_file():
-                    assert label not in self._waiting_for
+                    assert label in self._waiting_for
                     self._waiting_for.remove(label)
                     self.write_waiting_for()
 
@@ -987,7 +1000,7 @@ class BasicAction(ActionBase):
     def last_definition(self) -> Path:
         return self.storage / "last_definition.json"
 
-    def needs_rebuild(self, invoker: ActionInvoker, reason: str) -> bool:
+    def needs_rebuild(self, reason: str) -> bool:
         if (self.directory, self.name) in dependencies_ok:
             logger.debug(f"({self.directory}, {self.name}) in dependencies_ok")
             return False
@@ -1003,7 +1016,6 @@ class BasicAction(ActionBase):
                 dependencies_ok[(self.directory, self.name)] = True
                 return False
 
-        invoker.waiting_for(self.label)
         count = 0
         while True:
             count += 1
@@ -1012,10 +1024,12 @@ class BasicAction(ActionBase):
                 break
             if count > 1:
                 print(f"Waiting for {self.label} for {reason}")
-                logger.error(
+
+                logger.warning(
                     f"Couldn't require {self.label} for {reason} for build: {status=} deadlock?"
                 )
-                traceback.print_stack()
+                if check_deadlock(self.label):
+                    sys.exit(1)
             else:
                 logger.debug(
                     f"Couldn't require {self.label} for build: {status=} {count=}"
@@ -1066,33 +1080,71 @@ class BasicAction(ActionBase):
             return True
 
     def run_if_needed(self, invoker: ActionInvoker, reason: str) -> int | None:
-        needs_rebuild = self.needs_rebuild(invoker, reason)
-        if not needs_rebuild:
-            return 0
-        elif (
-            FUSEBUILD_INVOCATION_DIR in os.environ
-            and (
-                failed_file := Path(
-                    os.environ[FUSEBUILD_INVOCATION_DIR]
-                    + "/failed/"
-                    + str(self.full_path)
+        with invoker.waiting_for(self.label) as waiter:
+            needs_rebuild = self.needs_rebuild(reason)
+            if not needs_rebuild:
+                return 0
+            elif (
+                FUSEBUILD_INVOCATION_DIR in os.environ
+                and (
+                    failed_file := Path(
+                        os.environ[FUSEBUILD_INVOCATION_DIR]
+                        + "/failed/"
+                        + str(self.full_path)
+                    )
+                ).exists()
+            ):
+                retcode = int(failed_file.read_text())
+                logger.info(f"{self.label} failed with {retcode=}")
+                return retcode
+            elif self.incremental:
+                logger.info(
+                    f"Incremantal - run {self.full_path} again without cleaning"
                 )
-            ).exists()
-        ):
-            retcode = int(failed_file.read_text())
-            logger.info(f"{self.label} failed with {retcode=}")
-            return retcode
-        elif self.incremental:
-            logger.info(f"Incremantal - run {self.full_path} again without cleaning")
+                return self.run()
+            else:
+                logger.info(f"Clean and run {self.full_path} again")
+                self.last_definition().unlink(missing_ok=True)
+                self.clean()
+                access_log_file(self.label).unlink(missing_ok=True)
+                new_access_log_file(self.label).unlink(missing_ok=True)
+                action_deps_file(self.label).unlink(missing_ok=True)
             return self.run()
-        else:
-            logger.info(f"Clean and run {self.full_path} again")
-            self.last_definition().unlink(missing_ok=True)
-            self.clean()
-            access_log_file(self.label).unlink(missing_ok=True)
-            new_access_log_file(self.label).unlink(missing_ok=True)
-            action_deps_file(self.label).unlink(missing_ok=True)
-            return self.run()
+
+
+def check_deadlock_inner(
+    start_label: ActionLabel, label: ActionLabel
+) -> list[ActionLabel]:
+    action = ActionBase(label)
+    with action.get_status_lock_file().acquire(blocking=False):
+        with action.waiting_for_file.open("r") as f:
+            while True:
+                line = f.readline()
+                if line == None:
+                    break
+                logger.debug(f"Got {line} from {action.waiting_for_file}")
+                l = label_from_line(line)
+                if l == start_label:
+                    return [label, l]
+                deadlock_list = check_deadlock_inner(start_label, l)
+                if len(deadlock_list) > 0:
+                    return [label] + deadlock_list
+
+        return []
+
+
+def check_deadlock(label: ActionLabel) -> bool:
+    try:
+        deadlock_list = check_deadlock_inner(label, label)
+        if len(deadlock_list) > 0:
+            print("Deadlock:")
+            for l in deadlock_list:
+                print(f"    {l} ->")
+            return True
+        return False
+    except filelock.Timeout:
+        # Couldn't optain all the status locks, declare no deadlock for now
+        return False
 
 
 class LoadBuildFileAction(BasicAction):
