@@ -5,7 +5,8 @@ import time
 import uuid
 from pathlib import Path
 
-from fusebuild.core.libfusebuild import Status, get_rule_action
+from fusebuild.core.action_invoker import ActionInvoker, DummyInvoker
+from fusebuild.core.libfusebuild import ActionBase, Status, get_rule_action
 from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)
@@ -18,37 +19,22 @@ def _check_for_deadlock(
     return False
 
 
-def runtarget(buildfile: Path, target: str) -> int | None:
+def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | None:
     # os.setpgrp()
     logger.debug(f"Runtarget {buildfile=} {target=}")
-    count = 0
-    deadlock_count = 0
-    while True:
-        action = get_rule_action(buildfile, target)
-        if action is None:
-            return -1
-
-        res, status = action.require_for_build()
-        if res:
-            break
-        count += 1
-        if count > 2:
-            logger.info(
-                f"Waiting for {(Path(buildfile.parent), target)} with status {status}"
-            )
-        if _check_for_deadlock(status, (buildfile.parent, target), deadlock_count):
-            deadlock_count += 1
-        else:
-            deadlock_count = 0
-
-        time.sleep(1)
-
-    action = get_rule_action(buildfile.parent, target)
+    assert buildfile.is_file()
+    label = (buildfile.parent, target)
+    action = get_rule_action(buildfile.parent, target, invoker)
     if action is None:
         return -1
-    return_code = action.run_if_needed("?")
+    return_code = action.run_if_needed(invoker, "?")
     return return_code
 
 
 if __name__ == "__main__":
-    sys.exit(runtarget(Path(sys.argv[1]), sys.argv[2]))
+    invoker: ActionInvoker
+    if len(sys.argv) > 3:
+        invoker = ActionBase((Path(sys.argv[3]), sys.argv[4]))
+    else:
+        invoker = DummyInvoker()
+    sys.exit(_runtarget(Path(sys.argv[1]), sys.argv[2], invoker))

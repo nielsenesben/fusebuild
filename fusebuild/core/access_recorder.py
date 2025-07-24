@@ -17,6 +17,7 @@ from marshmallow_dataclass2 import class_schema
 import fusebuild.core.logger as logger_module
 
 from .action import ActionLabel, label_from_line
+from .action_invoker import ActionInvoker
 from .dependency import (
     AccessType,
     ActionSetupRecorder,
@@ -183,7 +184,10 @@ class AccessRecorder:
 
 def check_accesses_inner_loop(
     label: ActionLabel,
-    check_build_target: Callable[[Path], tuple[bool, tuple[Path, str] | None]],
+    check_build_target: Callable[
+        [Path, ActionInvoker], tuple[bool, tuple[Path, str] | None]
+    ],
+    invoker: ActionInvoker,
 ) -> bool:
     matches = True
     central_dir = label[0].absolute()
@@ -205,7 +209,7 @@ def check_accesses_inner_loop(
                         matches = False
                         break
                 else:
-                    check_build_target(src_path)
+                    check_build_target(src_path, invoker)
 
             logger.debug(f"Checking {path} for {key}")
             match key.access_type:
@@ -282,11 +286,14 @@ def merge_access_logs(label: ActionLabel):
 
 def check_accesses(
     label: ActionLabel,
-    check_build_target: Callable[[Path], tuple[bool, tuple[Path, str] | None]],
+    check_build_target: Callable[
+        [Path, ActionInvoker], tuple[bool, tuple[Path, str] | None]
+    ],
+    invoker: ActionInvoker,
 ) -> bool:
     merge_access_logs(label)
     try:
-        return check_accesses_inner_loop(label, check_build_target)
+        return check_accesses_inner_loop(label, check_build_target, invoker)
     except FileNotFoundError as e:
         logger.debug(f"Got {e=}")
         return False

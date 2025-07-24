@@ -11,15 +11,18 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import TracebackType
 
 import psutil
 from result import Err, Ok
 
 from .access_recorder import load_action_deps
 from .action import Action, ActionLabel
+from .action_invoker import DummyInvoker
 from .graph import sort_graph
 from .libfusebuild import (
     FUSEBUILD_INVOCATION_DIR,
+    ActionInvoker,
     BasicAction,
     all_actions,
     check_build_file,
@@ -51,6 +54,7 @@ def main_inner(args: list[str]) -> int:
 
     categories = arg.category.split(",")
 
+    invoker = DummyInvoker()
     targets: dict[ActionLabel, Action] = {}
     for ti in arg.target:
         t: Path = ti.absolute()
@@ -59,7 +63,7 @@ def main_inner(args: list[str]) -> int:
             if not t.is_dir():
                 print(f"{t} is an file, not an action", file=sys.stderr)
                 sys.exit(1)
-            ret = find_all_actions(t)
+            ret = find_all_actions(t, invoker)
             match ret:
                 case Err(failed):
                     print(f"Failed to load {failed}.", file=sys.stderr)
@@ -67,7 +71,7 @@ def main_inner(args: list[str]) -> int:
                 case Ok(actions):
                     targets.update(actions)
         else:
-            label_action = get_action_from_path(t)
+            label_action = get_action_from_path(t, invoker)
             if label_action is None:
                 print(f"Can't find action for {t}", file=sys.stderr)
                 return 1
@@ -92,7 +96,7 @@ def main_inner(args: list[str]) -> int:
     sorted_actions = sort_graph(graph)
     logger.info(f"{sorted_actions=}")
     for label in sorted_actions:
-        rule_action = get_rule_action(label[0], label[1])
+        rule_action = get_rule_action(label[0], label[1], invoker)
         if rule_action is None:
             if label in targets:
                 print(f"Can't find action for {label}", file=sys.stderr)
@@ -108,7 +112,7 @@ def main_inner(args: list[str]) -> int:
         if not needs_rebuild:
             print(".. Unchanged")
         else:
-            res = run_action(label[0], label[1])
+            res = run_action(label[0], label[1], invoker)
             if res != 0:
                 print(".. failed")
                 if label in targets:

@@ -26,17 +26,19 @@ import time
 import traceback
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum
 from errno import *
 from pathlib import Path
 from stat import *
 from threading import Lock, Thread
+from types import TracebackType
 from typing import Any, Iterable, Optional, Protocol
 
+import filelock
 import marshmallow_dataclass2
 import psutil
-from filelock import FileLock
 from marshmallow_dataclass2 import class_schema
 from result import Err, Ok, Result
 
@@ -56,6 +58,7 @@ from fusebuild.core.action import (
     MappingDefinition,
     RandomTmpDir,
     TmpDir,
+    label_from_line,
 )
 from fusebuild.core.dependency import ActionSetupRecorder
 from fusebuild.core.file_layout import (
@@ -65,6 +68,8 @@ from fusebuild.core.file_layout import (
     output_folder_root,
     output_folder_root_str,
 )
+
+from .action_invoker import ActionInvoker
 
 # pull in some spaghetti to make this stuff work without fuse-py being installed
 try:
@@ -150,8 +155,9 @@ def flag2mode(flags):
     return m
 
 
-def run_action(directory: Path, target: str) -> int:
+def run_action(directory: Path, target: str, invoker: ActionInvoker) -> int:
     logger.debug(f"Run action {directory} / {target}")
+    process = None
     try:
         process = psutil.Popen(
             [
@@ -159,7 +165,8 @@ def run_action(directory: Path, target: str) -> int:
                 str(Path(__file__).parent / "runtarget.py"),
                 str(directory.absolute() / "FUSEBUILD.py"),
                 target,
-            ],
+            ]
+            + invoker.runtarget_args(),
             env=os.environ,
         )
         res = process.wait()
@@ -175,7 +182,9 @@ def run_action(directory: Path, target: str) -> int:
 dependencies_ok: dict[tuple[Path, str], bool] = {}
 
 
-def check_build_target(src_dir: Path) -> tuple[bool, ActionLabel | None]:
+def check_build_target(
+    src_dir: Path, invoker: ActionInvoker
+) -> tuple[bool, ActionLabel | None]:
     src_dir = src_dir.absolute()
     while True:
         logger.debug(f"{src_dir=}")
@@ -213,7 +222,7 @@ def check_build_target(src_dir: Path) -> tuple[bool, ActionLabel | None]:
             logger.debug(f"{label} was already marked as failed.")
             return False, label
 
-    action = get_action(src_dir, target)
+    action = get_action(src_dir, target, invoker)
     match action:
         case None:
             # clean_nonexisting_action(src_dir, target)
@@ -224,7 +233,7 @@ def check_build_target(src_dir: Path) -> tuple[bool, ActionLabel | None]:
             pass
 
     logger.info(f"Dependency {src_dir}/{target}")
-    res = run_action(src_dir, target)
+    res = run_action(src_dir, target, invoker)
     logger.info(f"Dependency {src_dir}/{target} returned {res}")
     if res == 0:
         dependencies_ok[label] = True
@@ -237,6 +246,7 @@ class BasicMount(Fuse):
     def __init__(
         self,
         label: ActionLabel,
+        invoker: ActionInvoker,
         mountpoint: Path,
         access_recorder: AccessRecorder,
         writeable: str,
@@ -245,6 +255,7 @@ class BasicMount(Fuse):
         **kw,
     ):
         self.label = label
+        self.invoker = invoker
         self.fuse_args = FuseArgs()
         self.fuse_args.setmod("foreground")
         self.fuse_args.mountpoint = str(mountpoint.absolute())
@@ -282,7 +293,7 @@ class BasicMount(Fuse):
             self.access_recorder.record_dir_exists(src_dir, True)
         else:
             self.access_recorder.record_dir_exists(src_dir, False)
-            success, label = check_build_target(src_dir)
+            success, label = check_build_target(src_dir, self.invoker)
             if label is not None:
                 self.access_recorder.action_deps.add(label)
             if not success:
@@ -647,19 +658,67 @@ class StatusEnum(Enum):
 @dataclass
 class Status:
     status: StatusEnum
-    waiting_for: list[tuple[(str, str)]]
     running_pid: Optional[int] = os.getpid()
 
 
-class BasicAction(object):
-    def __init__(self, directory: Path, name: str, action: Action):
-        self.action_setup_record = ActionSetupRecorder(action, os_environ())
-        self.directory = directory.absolute()
-        self.name = name
-        self.full_path = self.directory / name
+class ActionBase(ActionInvoker):
+    def __init__(self, label: ActionLabel):
+        self._waiting_for: set[ActionLabel] = set([])
+        self.directory = label[0].absolute()
+        self.name = label[1]
+        self.full_path = self.directory / self.name
         logger.debug(f"{self.full_path=}")
         self.storage = fusebuild_folder / ("actions" + str(self.full_path))
         logger.debug(f"{self.storage=}")
+
+    @property
+    def label(self):
+        return (self.directory, self.name)
+
+    def runtarget_args(self) -> list[str]:
+        return [self.label[0], self.label[1]]
+
+    @property
+    def waiting_for_file(self):
+        return self.storage / "waiting_for"
+
+    def write_waiting_for(self):
+        logger.debug(
+            f"write_waiting_for {self.label} to {self.waiting_for_file}: {self._waiting_for}"
+        )
+        with self.waiting_for_file.open("w") as f:
+            f.writelines([f"{str(l[0])}/{l[1]}" for l in self._waiting_for])
+
+    def get_status_lock_file(self) -> filelock.FileLock:
+        return filelock.FileLock(str(self.storage / "status.lck"))
+
+    def waiting_for(self, label: ActionLabel) -> AbstractContextManager:
+        class WaitingFor:
+            def __enter__(this):
+                with self.get_status_lock_file():
+                    assert label not in self._waiting_for
+                    self._waiting_for.add(label)
+                    self.write_waiting_for()
+                return this
+
+            def __exit__(
+                this,
+                exc_type: type[BaseException] | None,
+                exc_val: BaseException | None,
+                exc_tb: TracebackType | None,
+            ) -> None:
+                with self.get_status_lock_file():
+                    assert label in self._waiting_for
+                    self._waiting_for.remove(label)
+                    self.write_waiting_for()
+
+        return WaitingFor()
+
+
+class BasicAction(ActionBase):
+    def __init__(self, label: ActionLabel, action: Action):
+        super().__init__(label)
+        self.action_setup_record = ActionSetupRecorder(action, os_environ())
         self.incremental = False
         self.building = True
         self.build_process: psutil.Popen | None = None
@@ -667,10 +726,6 @@ class BasicAction(object):
 
     def output_folder(self) -> Path:
         return Path(output_folder_root_str + str(self.full_path))
-
-    @property
-    def label(self):
-        return (self.directory, self.name)
 
     @property
     def action(self):
@@ -898,21 +953,20 @@ class BasicAction(object):
             d = json.load(f)
             return schema.load(d)
 
-    def get_status_lock_file(self) -> FileLock:
-        return FileLock(str(self.storage / "status.lck"))
-
     def require_for_build(self) -> tuple[bool, Status]:
         with self.get_status_lock_file() as lock:
             status = self._read_status()
             logger.debug(f"Status for {self.full_path} was {status}")
             if not status or status.status == StatusEnum.DONE:
-                status = Status(StatusEnum.REQUIRING, [])
+                status = Status(StatusEnum.REQUIRING)
                 self._write_status(status)
                 return True, status
             else:
                 if check_pid(status.running_pid):
                     return False, status
                 else:
+                    status = Status(StatusEnum.REQUIRING)
+                    self._write_status(status)
                     return True, status
 
     def _write_status(self, status: Status) -> None:
@@ -933,7 +987,6 @@ class BasicAction(object):
         with self.get_status_lock_file() as lock:
             status = Status(
                 self.status,
-                [],
                 running_pid=os.getpid(),
             )
             self._write_status(status)
@@ -971,10 +1024,12 @@ class BasicAction(object):
                 break
             if count > 1:
                 print(f"Waiting for {self.label} for {reason}")
-                logger.error(
+
+                logger.warning(
                     f"Couldn't require {self.label} for {reason} for build: {status=} deadlock?"
                 )
-                traceback.print_stack()
+                if check_deadlock(self.label):
+                    sys.exit(1)
             else:
                 logger.debug(
                     f"Couldn't require {self.label} for build: {status=} {count=}"
@@ -1014,7 +1069,7 @@ class BasicAction(object):
                 print(f"{self.directory} / {self.name}: Action changed")
                 matches = False
             else:
-                matches = check_accesses(self.label, check_build_target)
+                matches = check_accesses(self.label, check_build_target, self)
 
         if action_setup_record_old is None:
             return True
@@ -1024,34 +1079,72 @@ class BasicAction(object):
         else:
             return True
 
-    def run_if_needed(self, reason: str) -> int | None:
-        needs_rebuild = self.needs_rebuild(reason)
-        if not needs_rebuild:
-            return 0
-        elif (
-            FUSEBUILD_INVOCATION_DIR in os.environ
-            and (
-                failed_file := Path(
-                    os.environ[FUSEBUILD_INVOCATION_DIR]
-                    + "/failed/"
-                    + str(self.full_path)
+    def run_if_needed(self, invoker: ActionInvoker, reason: str) -> int | None:
+        with invoker.waiting_for(self.label) as waiter:
+            needs_rebuild = self.needs_rebuild(reason)
+            if not needs_rebuild:
+                return 0
+            elif (
+                FUSEBUILD_INVOCATION_DIR in os.environ
+                and (
+                    failed_file := Path(
+                        os.environ[FUSEBUILD_INVOCATION_DIR]
+                        + "/failed/"
+                        + str(self.full_path)
+                    )
+                ).exists()
+            ):
+                retcode = int(failed_file.read_text())
+                logger.info(f"{self.label} failed with {retcode=}")
+                return retcode
+            elif self.incremental:
+                logger.info(
+                    f"Incremantal - run {self.full_path} again without cleaning"
                 )
-            ).exists()
-        ):
-            retcode = int(failed_file.read_text())
-            logger.info(f"{self.label} failed with {retcode=}")
-            return retcode
-        elif self.incremental:
-            logger.info(f"Incremantal - run {self.full_path} again without cleaning")
+                return self.run()
+            else:
+                logger.info(f"Clean and run {self.full_path} again")
+                self.last_definition().unlink(missing_ok=True)
+                self.clean()
+                access_log_file(self.label).unlink(missing_ok=True)
+                new_access_log_file(self.label).unlink(missing_ok=True)
+                action_deps_file(self.label).unlink(missing_ok=True)
             return self.run()
-        else:
-            logger.info(f"Clean and run {self.full_path} again")
-            self.last_definition().unlink(missing_ok=True)
-            self.clean()
-            access_log_file(self.label).unlink(missing_ok=True)
-            new_access_log_file(self.label).unlink(missing_ok=True)
-            action_deps_file(self.label).unlink(missing_ok=True)
-            return self.run()
+
+
+def check_deadlock_inner(
+    start_label: ActionLabel, label: ActionLabel
+) -> list[ActionLabel]:
+    action = ActionBase(label)
+    with action.get_status_lock_file().acquire(blocking=False):
+        with action.waiting_for_file.open("r") as f:
+            while True:
+                line = f.readline()
+                if line == None:
+                    break
+                logger.debug(f"Got {line} from {action.waiting_for_file}")
+                l = label_from_line(line)
+                if l == start_label:
+                    return [label, l]
+                deadlock_list = check_deadlock_inner(start_label, l)
+                if len(deadlock_list) > 0:
+                    return [label] + deadlock_list
+
+        return []
+
+
+def check_deadlock(label: ActionLabel) -> bool:
+    try:
+        deadlock_list = check_deadlock_inner(label, label)
+        if len(deadlock_list) > 0:
+            print("Deadlock:")
+            for l in deadlock_list:
+                print(f"    {l} ->")
+            return True
+        return False
+    except filelock.Timeout:
+        # Couldn't optain all the status locks, declare no deadlock for now
+        return False
 
 
 class LoadBuildFileAction(BasicAction):
@@ -1065,9 +1158,9 @@ class LoadBuildFileAction(BasicAction):
         ]
 
         self.buildfile = buildfile
-        super(LoadBuildFileAction, self).__init__(
-            buildfile.parent,
-            "FUSEBUILD.py",
+        BasicAction.__init__(
+            self,
+            (buildfile.parent, "FUSEBUILD.py"),
             Action(cmd, category="", tmp=RandomTmpDir()),
         )
 
@@ -1085,14 +1178,14 @@ class LoadBuildFileAction(BasicAction):
 
 
 class RuleAction(BasicAction):
-    def __init__(self, path: Path, name: str, action: Action) -> None:
-        super(RuleAction, self).__init__(path, name, action)
+    def __init__(self, label: ActionLabel, action: Action) -> None:
+        super(RuleAction, self).__init__(label, action)
 
 
 def clean_nonexisting_action(path: Path, name: str):
     logger.info(f"Clean non-exsisting target {path}/{name}")
     empty_action = Action(cmd=[], category="internal_clean")
-    action = RuleAction(path, name, empty_action)
+    action = RuleAction((path, name), empty_action)
     action.require_for_build()
     action.clean()
     action.status = StatusEnum.DELETED
@@ -1142,14 +1235,14 @@ def load_actions(path: Path) -> dict[ActionLabel, Action]:
 
 
 def check_build_file(
-    buildfile: Path, reason: str
+    buildfile: Path, invoker: ActionInvoker, reason: str
 ) -> Result[dict[ActionLabel, Action], int | None]:
     logger.debug(f"check_build_file({buildfile})")
     buildfile = buildfile.absolute()
     if not buildfile.exists():
         return Err(None)
     action = LoadBuildFileAction(buildfile)
-    ret = action.run_if_needed(reason)
+    ret = action.run_if_needed(invoker, reason)
     if ret is not None:
         action.release_lock()
     logger.debug(f"LoadBuildFileAction({buildfile}) {ret=}")
@@ -1159,7 +1252,9 @@ def check_build_file(
     return Ok(load_actions(buildfile.parent))
 
 
-def get_action(path: Path | str, action: str) -> Action | None | int:
+def get_action(
+    path: Path | str, action: str, invoker: ActionInvoker
+) -> Action | None | int:
     logger.debug(f"get_action({path}, {action})")
     if isinstance(path, str):
         path = Path(path)
@@ -1174,7 +1269,7 @@ def get_action(path: Path | str, action: str) -> Action | None | int:
         # SBUILD file load and actions are up-to-date, but no such action
         return None
 
-    res = check_build_file(path / "FUSEBUILD.py", str((path, action)))
+    res = check_build_file(path / "FUSEBUILD.py", invoker, str((path, action)))
     match res:
         case Err(ret):
             logger.warning(f"Failed to load {path / 'FUSEBUILD.py'}: Returned {ret}")
@@ -1189,8 +1284,8 @@ def get_action(path: Path | str, action: str) -> Action | None | int:
     return loaded_actions[(path, action)]
 
 
-def get_rule_action(p: Path, name: str) -> RuleAction | None:
-    action = get_action(p, name)
+def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> RuleAction | None:
+    action = get_action(p, name, invoker)
     logger.debug(f"get_rule_action({p}, {name}) = {action}")
     match action:
         case None:
@@ -1198,10 +1293,15 @@ def get_rule_action(p: Path, name: str) -> RuleAction | None:
         case int(res):
             return None
         case _:
-            return RuleAction(p, name, action)
+            p = p.absolute()
+            if p.is_file():
+                p = p.parent
+            return RuleAction((p, name), action)
 
 
-def get_action_from_path(t: Path) -> tuple[ActionLabel, Action] | None:
+def get_action_from_path(
+    t: Path, invoker: ActionInvoker
+) -> tuple[ActionLabel, Action] | None:
     t = t.absolute()
     while True:
         name = t.name
@@ -1209,7 +1309,7 @@ def get_action_from_path(t: Path) -> tuple[ActionLabel, Action] | None:
         logger.debug(f"{t=} {name=}")
         build_file = t / "FUSEBUILD.py"
         if build_file.exists():
-            action = get_action(t, name)
+            action = get_action(t, name, invoker)
             logger.debug(f"get_action({t}, {name}) returned {action=}")
             if isinstance(action, Action):
                 return ((t, name), action)
@@ -1222,12 +1322,14 @@ def get_action_from_path(t: Path) -> tuple[ActionLabel, Action] | None:
     return None
 
 
-def find_all_actions(d: Path) -> Result[dict[ActionLabel, Action], set[Path]]:
+def find_all_actions(
+    d: Path, invoker: ActionInvoker
+) -> Result[dict[ActionLabel, Action], set[Path]]:
     fails: set[Path] = set([])
     actions: dict[ActionLabel, Action] = {}
     build_files = d.glob("**/FUSEBUILD.py")
     for bf in build_files:
-        res = check_build_file(bf, f"finding all actions in {d}")
+        res = check_build_file(bf, invoker, "finding all actions in {d}")
         match res:
             case Err(ret):
                 logger.error(f"Failed to load {bf}: Returned {ret}")
