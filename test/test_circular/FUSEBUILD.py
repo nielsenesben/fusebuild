@@ -20,3 +20,10 @@ shell_action(
     category="circular",
     tmp=None,
 )
+
+shell_action(
+    name="D",
+    cmd="cp $OUTPUT_DIR/../C/file.txt $OUTPUT_DIR/file.txt",
+    category="circular",
+    tmp=None,
+)
