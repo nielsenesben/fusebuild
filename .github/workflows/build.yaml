@@ -14,6 +14,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+
     - name: Disable userns security on latest ubuntu
       run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
 
@@ -22,3 +23,8 @@ jobs:
 
     - name: Run build all
       run: ./build_all.sh
+
+    - name: Check pre-commit
+      run: |
+        . .venv/bin/activate
+        pre-commit run --show-diff-on-failure --color=always --all-files

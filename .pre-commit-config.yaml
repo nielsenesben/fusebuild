@@ -19,4 +19,3 @@ repos:
       hooks:
           - id: black
             name: Black formatting 25.1.0
-            language_version: python3.10
