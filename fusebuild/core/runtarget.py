@@ -27,7 +27,9 @@ def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | No
     action = get_rule_action(buildfile.parent, target, invoker)
     if action is None:
         return -1
-    return_code = action.run_if_needed(invoker, "?")
+    return_code = action.run_if_needed(
+        invoker, f"building {[str(a) for a in invoker.runtarget_args()]}"
+    )
     return return_code
 
 

@@ -1023,13 +1023,13 @@ class BasicAction(ActionBase):
             if required:
                 break
             if count > 1:
-                print(f"Waiting for {self.label} for {reason}")
-
                 logger.warning(
                     f"Couldn't require {self.label} for {reason} for build: {status=} deadlock?"
                 )
-                if check_deadlock(self.label):
+                if check_deadlock(self.label, reason):
                     sys.exit(1)
+                if count % 2 == 1:
+                    print(f"Waiting for {self.label} while {reason}")
             else:
                 logger.debug(
                     f"Couldn't require {self.label} for build: {status=} {count=}"
@@ -1113,31 +1113,33 @@ class BasicAction(ActionBase):
 
 
 def check_deadlock_inner(
-    start_label: ActionLabel, label: ActionLabel
+    seen: set[ActionLabel], label: ActionLabel
 ) -> list[ActionLabel]:
     action = ActionBase(label)
+    seen_next = seen.union([label])
     with action.get_status_lock_file().acquire(blocking=False):
-        with action.waiting_for_file.open("r") as f:
-            while True:
-                line = f.readline()
-                if line == None:
-                    break
-                logger.debug(f"Got {line} from {action.waiting_for_file}")
-                l = label_from_line(line)
-                if l == start_label:
-                    return [label, l]
-                deadlock_list = check_deadlock_inner(start_label, l)
-                if len(deadlock_list) > 0:
-                    return [label] + deadlock_list
+        if action.waiting_for_file.exists():
+            with action.waiting_for_file.open("r") as f:
+                while True:
+                    line = f.readline()
+                    if line == None:
+                        break
+                    logger.debug(f"Got {line} from {action.waiting_for_file}")
+                    l = label_from_line(line)
+                    if l in seen:
+                        return [label, l]
+                    deadlock_list = check_deadlock_inner(seen_next, l)
+                    if len(deadlock_list) > 0:
+                        return [label] + deadlock_list
 
-        return []
+    return []
 
 
-def check_deadlock(label: ActionLabel) -> bool:
+def check_deadlock(label: ActionLabel, reason: str) -> bool:
     try:
-        deadlock_list = check_deadlock_inner(label, label)
+        deadlock_list = check_deadlock_inner(set([]), label)
         if len(deadlock_list) > 0:
-            print("Deadlock:")
+            print(f"Deadlock when {reason}:")
             for l in deadlock_list:
                 print(f"    {l} ->")
             return True

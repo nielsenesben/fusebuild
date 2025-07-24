@@ -99,6 +99,18 @@ shell_action(
         )
         self.assertEqual(ret.returncode, 1)
 
+    def test_build_circular_from_out_of_circle(self):
+        ret = subprocess.run(
+            [
+                "python3",
+                "-m",
+                "fusebuild",
+                "circular",
+                str(self.workdir / "D"),
+            ]
+        )
+        self.assertEqual(ret.returncode, 1)
+
 
 if __name__ == "__main__":
     main()
