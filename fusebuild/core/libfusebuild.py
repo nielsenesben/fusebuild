@@ -682,7 +682,7 @@ class ActionBase(ActionInvoker):
     def waiting_for_file(self):
         return self.storage / "waiting_for"
 
-    def write_waiting_for(self):
+    def _write_waiting_for(self):
         logger.debug(
             f"write_waiting_for {self.label} to {self.waiting_for_file}: {self._waiting_for}"
         )
@@ -692,13 +692,23 @@ class ActionBase(ActionInvoker):
     def get_status_lock_file(self) -> filelock.FileLock:
         return filelock.FileLock(str(self.storage / "status.lck"))
 
+    def _read_status(self) -> Optional[Status]:
+        status_file = self.storage / "status.json"
+        if not status_file.exists():
+            return None
+
+        schema = marshmallow_dataclass2.class_schema(Status)()
+        with (status_file).open("r") as f:
+            d = json.load(f)
+            return schema.load(d)
+
     def waiting_for(self, label: ActionLabel) -> AbstractContextManager:
         class WaitingFor:
             def __enter__(this):
                 with self.get_status_lock_file():
                     assert label not in self._waiting_for
                     self._waiting_for.add(label)
-                    self.write_waiting_for()
+                    self._write_waiting_for()
                 return this
 
             def __exit__(
@@ -710,7 +720,7 @@ class ActionBase(ActionInvoker):
                 with self.get_status_lock_file():
                     assert label in self._waiting_for
                     self._waiting_for.remove(label)
-                    self.write_waiting_for()
+                    self._write_waiting_for()
 
         return WaitingFor()
 
@@ -943,16 +953,6 @@ class BasicAction(ActionBase):
         self.status = StatusEnum.DONE
         self.write_status()
 
-    def _read_status(self) -> Optional[Status]:
-        status_file = self.storage / "status.json"
-        if not status_file.exists():
-            return None
-
-        schema = marshmallow_dataclass2.class_schema(Status)()
-        with (status_file).open("r") as f:
-            d = json.load(f)
-            return schema.load(d)
-
     def require_for_build(self) -> tuple[bool, Status]:
         with self.get_status_lock_file() as lock:
             status = self._read_status()
@@ -1118,11 +1118,17 @@ def check_deadlock_inner(
     action = ActionBase(label)
     seen_next = seen.union([label])
     with action.get_status_lock_file().acquire(blocking=False):
+        status = action._read_status()
+        if status is None or status.status == StatusEnum.DONE:
+            return []
+        if not check_pid(status.running_pid):
+            return []
+
         if action.waiting_for_file.exists():
             with action.waiting_for_file.open("r") as f:
                 while True:
                     line = f.readline()
-                    if line == None:
+                    if line == None or len(line) == 0:
                         break
                     logger.debug(f"Got {line} from {action.waiting_for_file}")
                     l = label_from_line(line)
@@ -1137,7 +1143,7 @@ def check_deadlock_inner(
 
 def check_deadlock(label: ActionLabel, reason: str) -> bool:
     try:
-        deadlock_list = check_deadlock_inner(set([]), label)
+        deadlock_list = check_deadlock_inner(set([label]), label)
         if len(deadlock_list) > 0:
             print(f"Deadlock when {reason}:")
             for l in deadlock_list:
