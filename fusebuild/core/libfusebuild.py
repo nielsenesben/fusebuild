@@ -689,6 +689,10 @@ class ActionBase(ActionInvoker):
         with self.waiting_for_file.open("w") as f:
             f.writelines([f"{str(l[0])}/{l[1]}" for l in self._waiting_for])
 
+    def _read_waiting_for(self):
+        with self.waiting_for_file.open("r") as f:
+            self._waiting_for = set([label_from_line(l) for l in f.readlines()])
+
     def get_status_lock_file(self) -> filelock.FileLock:
         return filelock.FileLock(str(self.storage / "status.lck"))
 
@@ -706,7 +710,7 @@ class ActionBase(ActionInvoker):
         class WaitingFor:
             def __enter__(this):
                 with self.get_status_lock_file():
-                    assert label not in self._waiting_for
+                    self._read_waiting_for()
                     self._waiting_for.add(label)
                     self._write_waiting_for()
                 return this
@@ -718,6 +722,7 @@ class ActionBase(ActionInvoker):
                 exc_tb: TracebackType | None,
             ) -> None:
                 with self.get_status_lock_file():
+                    self._read_waiting_for()
                     assert label in self._waiting_for
                     self._waiting_for.remove(label)
                     self._write_waiting_for()
@@ -957,17 +962,18 @@ class BasicAction(ActionBase):
         with self.get_status_lock_file() as lock:
             status = self._read_status()
             logger.debug(f"Status for {self.full_path} was {status}")
-            if not status or status.status == StatusEnum.DONE:
+            if (
+                not status
+                or status.status == StatusEnum.DONE
+                or not check_pid(status.running_pid)
+            ):
                 status = Status(StatusEnum.REQUIRING)
                 self._write_status(status)
+                self._waiting_for = set([])
+                self._write_waiting_for()
                 return True, status
             else:
-                if check_pid(status.running_pid):
-                    return False, status
-                else:
-                    status = Status(StatusEnum.REQUIRING)
-                    self._write_status(status)
-                    return True, status
+                return False, status
 
     def _write_status(self, status: Status) -> None:
         logger.debug(f"Writing status {status}")
