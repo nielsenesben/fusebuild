@@ -107,19 +107,29 @@ def main_inner(args: list[str]) -> int:
                 continue
 
         print(f"{str(label[0])}/{label[1]}....", end="")
-        needs_rebuild = rule_action.needs_rebuild("from main loop")
+        needs_rebuild_result = rule_action.needs_rebuild("from main loop")
         rule_action.release_lock()
-        if not needs_rebuild:
-            print(".. Unchanged")
+        match needs_rebuild_result:
+            case Err(b):
+                logger.warning(
+                    f"Got error when calling need_rebuild on {rule_action.label}"
+                )
+                sys.exit(1)
+            case Ok(needs_rebuild):
+                if not needs_rebuild:
+                    print(".. Unchanged")
+                    continue
+            case _:
+                assert False
+
+        res = run_action(label[0], label[1], invoker)
+        if res != 0:
+            print(".. failed")
+            if label in targets:
+                return 1
+            # otherwise just continue - the _targets_ _might_ be ok
         else:
-            res = run_action(label[0], label[1], invoker)
-            if res != 0:
-                print(".. failed")
-                if label in targets:
-                    return 1
-                # otherwise just continue - the _targets_ _might_ be ok
-            else:
-                print("..Ok")
+            print("..Ok")
 
     return 0
 

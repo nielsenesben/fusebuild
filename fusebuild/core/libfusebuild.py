@@ -689,9 +689,11 @@ class ActionBase(ActionInvoker):
         with self.waiting_for_file.open("w") as f:
             f.writelines([f"{str(l[0])}/{l[1]}" for l in self._waiting_for])
 
-    def _read_waiting_for(self):
+    def _read_waiting_for(self) -> set[ActionLabel]:
         with self.waiting_for_file.open("r") as f:
             self._waiting_for = set([label_from_line(l) for l in f.readlines()])
+
+        return self._waiting_for
 
     def get_status_lock_file(self) -> filelock.FileLock:
         return filelock.FileLock(str(self.storage / "status.lck"))
@@ -1006,10 +1008,10 @@ class BasicAction(ActionBase):
     def last_definition(self) -> Path:
         return self.storage / "last_definition.json"
 
-    def needs_rebuild(self, reason: str) -> bool:
+    def needs_rebuild(self, reason: str) -> Result[bool, bool]:
         if (self.directory, self.name) in dependencies_ok:
             logger.debug(f"({self.directory}, {self.name}) in dependencies_ok")
-            return False
+            return Ok(False)
         if FUSEBUILD_INVOCATION_DIR in os.environ:
             if Path(
                 os.environ[FUSEBUILD_INVOCATION_DIR]
@@ -1020,7 +1022,7 @@ class BasicAction(ActionBase):
             ).exists():
                 logger.debug(f"({self.directory}, {self.name}) in invocation dir")
                 dependencies_ok[(self.directory, self.name)] = True
-                return False
+                return Ok(False)
 
         count = 0
         while True:
@@ -1033,7 +1035,7 @@ class BasicAction(ActionBase):
                     f"Couldn't require {self.label} for {reason} for build: {status=} deadlock?"
                 )
                 if check_deadlock(self.label, reason):
-                    sys.exit(1)
+                    return Err(True)
                 if count % 2 == 1:
                     print(f"Waiting for {self.label} while {reason}")
             else:
@@ -1078,19 +1080,24 @@ class BasicAction(ActionBase):
                 matches = check_accesses(self.label, check_build_target, self)
 
         if action_setup_record_old is None:
-            return True
+            return Ok(True)
         elif matches and action_setup_record_old.return_code == 0:
             self.mark_as_done(0)
-            return False
+            return Ok(False)
         else:
-            return True
+            return Ok(True)
 
     def run_if_needed(self, invoker: ActionInvoker, reason: str) -> int | None:
         with invoker.waiting_for(self.label) as waiter:
-            needs_rebuild = self.needs_rebuild(reason)
-            if not needs_rebuild:
-                return 0
-            elif (
+            match self.needs_rebuild(reason):
+                case Err(b):
+                    return -1
+                case Ok(needs_rebuild):
+                    if not needs_rebuild:
+                        return 0
+                case _:
+                    assert False
+            if (
                 FUSEBUILD_INVOCATION_DIR in os.environ
                 and (
                     failed_file := Path(
@@ -1130,19 +1137,12 @@ def check_deadlock_inner(
         if not check_pid(status.running_pid):
             return []
 
-        if action.waiting_for_file.exists():
-            with action.waiting_for_file.open("r") as f:
-                while True:
-                    line = f.readline()
-                    if line == None or len(line) == 0:
-                        break
-                    logger.debug(f"Got {line} from {action.waiting_for_file}")
-                    l = label_from_line(line)
-                    if l in seen:
-                        return [label, l]
-                    deadlock_list = check_deadlock_inner(seen_next, l)
-                    if len(deadlock_list) > 0:
-                        return [label] + deadlock_list
+        for l in action._read_waiting_for():
+            if l in seen:
+                return [label, l]
+            deadlock_list = check_deadlock_inner(seen_next, l)
+            if len(deadlock_list) > 0:
+                return [label] + deadlock_list
 
     return []
 
@@ -1151,6 +1151,7 @@ def check_deadlock(label: ActionLabel, reason: str) -> bool:
     try:
         deadlock_list = check_deadlock_inner(set([label]), label)
         if len(deadlock_list) > 0:
+            logger.warning(f"Deadlock: {deadlock_list}")
             print(f"Deadlock when {reason}:")
             for l in deadlock_list:
                 print(f"    {l} ->")

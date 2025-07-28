@@ -111,6 +111,50 @@ shell_action(
         )
         self.assertEqual(ret.returncode, 1)
 
+    def test_circular_fusebuild_files(self):
+        # Avoid original error
+        (self.workdir / "FUSEBUILD.py").write_text("")
+        (self.workdir / "subA").mkdir()
+        (self.workdir / "subA" / "FUSEBUILD.py").write_text(
+            """from fusebuild import shell_action, get_action
+
+
+shell_action(
+    name="A",
+    cmd="echo ok A",
+    category="circular",
+    tmp=None,
+)
+
+get_action("../subB", "B")
+"""
+        )
+        (self.workdir / "subB").mkdir()
+        (self.workdir / "subB" / "FUSEBUILD.py").write_text(
+            """from fusebuild import shell_action, get_action
+
+
+shell_action(
+    name="B",
+    cmd="echo ok B",
+    category="circular",
+    tmp=None,
+)
+
+get_action("../subA", "A")
+"""
+        )
+        ret = subprocess.run(
+            [
+                "python3",
+                "-m",
+                "fusebuild",
+                "build",
+                str(self.workdir),
+            ]
+        )
+        self.assertEqual(ret.returncode, 1)
+
 
 if __name__ == "__main__":
     main()
