@@ -17,13 +17,16 @@ import psutil
 from result import Err, Ok
 
 from .access_recorder import load_action_deps
-from .action import Action, ActionLabel
+from .action import Action, ActionLabel, label_from_line
 from .action_invoker import DummyInvoker
+from .file_layout import action_dir
 from .graph import sort_graph
 from .libfusebuild import (
     FUSEBUILD_INVOCATION_DIR,
+    ActionBase,
     ActionInvoker,
     BasicAction,
+    StatusEnum,
     all_actions,
     check_build_file,
     find_all_actions,
@@ -34,6 +37,43 @@ from .libfusebuild import (
 from .logger import FUSEBUILD_LOG_LEVEL, getLogger
 
 logger = getLogger(__name__)
+
+
+def copy_file_to_stderr(name: Path) -> None:
+    with name.open("rb") as f:
+        while True:
+            data = f.read(4096)
+            if not data:
+                break
+            sys.stderr.buffer.write(data)
+
+
+def print_failure(label: ActionLabel) -> None:
+    action = ActionBase(label)
+    with action.get_status_lock_file().acquire(blocking=False):
+        status = action._read_status()
+        assert status is not None  # Must have run now, so status can't be None
+        if status.status != StatusEnum.DONE:
+            print(
+                f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed"
+            )
+            return
+        subbuild_failed_file = action_dir(label) / "subbuild_failed"
+        if subbuild_failed_file.exists():
+            with subbuild_failed_file.open("r") as f:
+                for line in set(f.readlines()):
+                    failed_label = label_from_line(line)
+                    print(f"{label} failed due to {failed_label}", file=sys.stderr)
+                    print_failure(failed_label)
+        else:
+            stderr_out = action_dir(label) / "stderr"
+            if stderr_out.exists():
+                print(f"Stderr of {label}:", file=sys.stderr)
+                copy_file_to_stderr(stderr_out)
+            stdout_out = action_dir(label) / "stdout"
+            if stdout_out.exists():
+                print(f"Stdout of {label}:", file=sys.stderr)
+                copy_file_to_stderr(stdout_out)
 
 
 def main_inner(args: list[str]) -> int:
@@ -126,6 +166,7 @@ def main_inner(args: list[str]) -> int:
         if res != 0:
             print(".. failed")
             if label in targets:
+                print_failure(label)
                 return 1
             # otherwise just continue - the _targets_ _might_ be ok
         else:
