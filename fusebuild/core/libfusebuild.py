@@ -663,7 +663,7 @@ class Status:
 
 class ActionBase(ActionInvoker):
     def __init__(self, label: ActionLabel):
-        self._waiting_for: set[ActionLabel] = set([])
+        self._waiting_for: dict[ActionLabel, int] = {}
         self.directory = label[0].absolute()
         self.name = label[1]
         self.full_path = self.directory / self.name
@@ -687,11 +687,15 @@ class ActionBase(ActionInvoker):
             f"write_waiting_for {self.label} to {self.waiting_for_file}: {self._waiting_for}"
         )
         with self.waiting_for_file.open("w") as f:
-            f.writelines([f"{str(l[0])}/{l[1]}" for l in self._waiting_for])
+            for l, c in self._waiting_for.items():
+                json.dump({"label": (str(l[0]), l[1]), "count": c}, f)
 
-    def _read_waiting_for(self) -> set[ActionLabel]:
+    def _read_waiting_for(self) -> dict[ActionLabel, int]:
         with self.waiting_for_file.open("r") as f:
-            self._waiting_for = set([label_from_line(l) for l in f.readlines()])
+            for line in f.readlines():
+                js = json.loads(line)
+                label = (Path(js["label"][0]), js["label"][1])
+                self._waiting_for[label] = int(js["count"])
 
         return self._waiting_for
 
@@ -713,7 +717,11 @@ class ActionBase(ActionInvoker):
             def __enter__(this):
                 with self.get_status_lock_file():
                     self._read_waiting_for()
-                    self._waiting_for.add(label)
+                    if label in self._waiting_for:
+                        self._waiting_for[label] += 1
+                    else:
+                        self._waiting_for[label] = 1
+
                     self._write_waiting_for()
                 return this
 
@@ -726,7 +734,10 @@ class ActionBase(ActionInvoker):
                 with self.get_status_lock_file():
                     self._read_waiting_for()
                     assert label in self._waiting_for
-                    self._waiting_for.remove(label)
+                    assert self._waiting_for[label] > 0
+                    self._waiting_for[label] -= 1
+                    if self._waiting_for[label] <= 0:
+                        self._waiting_for.pop(label)
                     self._write_waiting_for()
 
         return WaitingFor()
@@ -973,7 +984,7 @@ class BasicAction(ActionBase):
             ):
                 status = Status(StatusEnum.REQUIRING)
                 self._write_status(status)
-                self._waiting_for = set([])
+                self._waiting_for.clear()
                 self._write_waiting_for()
                 return True, status
             else:
