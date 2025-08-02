@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from types import TracebackType
 
+import filelock
 import psutil
 from result import Err, Ok
 
@@ -48,32 +49,51 @@ def copy_file_to_stderr(name: Path) -> None:
             sys.stderr.buffer.write(data)
 
 
-def print_failure(label: ActionLabel) -> None:
+def print_output(label: ActionLabel):
+    stderr_out = action_dir(label) / "stderr"
+    if stderr_out.exists():
+        print(f"Stderr of {label}:", file=sys.stderr)
+        copy_file_to_stderr(stderr_out)
+    stdout_out = action_dir(label) / "stdout"
+    if stdout_out.exists():
+        print(f"Stdout of {label}:", file=sys.stderr)
+        copy_file_to_stderr(stdout_out)
+
+
+def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
+    if label in seen:
+        print(f"Deadlock detected at {label}", file=sys.stderr)
+        print_output(label)
+        return
     action = ActionBase(label)
-    with action.get_status_lock_file().acquire(blocking=False):
-        status = action._read_status()
-        assert status is not None  # Must have run now, so status can't be None
-        if status.status != StatusEnum.DONE:
-            print(
-                f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed"
-            )
-            return
-        subbuild_failed_file = action_dir(label) / "subbuild_failed"
-        if subbuild_failed_file.exists():
-            with subbuild_failed_file.open("r") as f:
-                for line in set(f.readlines()):
-                    failed_label = label_from_line(line)
-                    print(f"{label} failed due to {failed_label}", file=sys.stderr)
-                    print_failure(failed_label)
-        else:
-            stderr_out = action_dir(label) / "stderr"
-            if stderr_out.exists():
-                print(f"Stderr of {label}:", file=sys.stderr)
-                copy_file_to_stderr(stderr_out)
-            stdout_out = action_dir(label) / "stdout"
-            if stdout_out.exists():
-                print(f"Stdout of {label}:", file=sys.stderr)
-                copy_file_to_stderr(stdout_out)
+    try:
+        with action.get_status_lock_file().acquire(blocking=False):
+            status = action._read_status()
+            assert status is not None  # Must have run now, so status can't be None
+            if status.status != StatusEnum.DONE:
+                print(
+                    f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed"
+                )
+                return
+            subbuild_failed_file = action_dir(label) / "subbuild_failed"
+            if subbuild_failed_file.exists():
+                seen2 = seen.union({label})
+                with subbuild_failed_file.open("r") as f:
+                    for line in set(f.readlines()):
+                        failed_label = label_from_line(line)
+                        print(f"{label} failed due to {failed_label}", file=sys.stderr)
+                        print_failure(failed_label, seen2)
+            else:
+                print_output(label)
+    except filelock.Timeout as to:
+        subprocess.run(["fuser", str(action.storage / "status.lck")])
+        subprocess.run(["ps", "auxfwwww"])
+        print(
+            f"Can't get lock in {label}, and print further information.",
+            file=sys.stderr,
+        )
+        print(f"This is usually due to a deadlock or a another fusebuild running.")
+        print_output(label)
 
 
 def main_inner(args: list[str]) -> int:
@@ -166,7 +186,7 @@ def main_inner(args: list[str]) -> int:
         if res != 0:
             print(".. failed")
             if label in targets:
-                print_failure(label)
+                print_failure(label, set([]))
                 return 1
             # otherwise just continue - the _targets_ _might_ be ok
         else:

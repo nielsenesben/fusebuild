@@ -15,6 +15,6 @@ provider = get_action(Path("."), "hasprovider").providers["testprovider"]
 
 shell_action(
     name="useprovider",
-    cmd=f"test hallo = $(cat {provider.get_some_file().absolute()})",
+    cmd=f"test hallo = $(cat {provider.get_some_file().absolute()})",  # type: ignore
     category="test",
 )
