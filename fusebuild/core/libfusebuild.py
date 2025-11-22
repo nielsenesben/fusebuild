@@ -297,7 +297,7 @@ class BasicMount(Fuse):
             if label is not None:
                 self.access_recorder.action_deps.add(label)
             if not success:
-                with (action_dir(self.label) / "subbuild_faild").open("a") as f:
+                with (action_dir(self.label) / "subbuild_failed").open("a") as f:
                     if label is None:
                         f.write("something odd")
                     else:
@@ -663,7 +663,7 @@ class Status:
 
 class ActionBase(ActionInvoker):
     def __init__(self, label: ActionLabel):
-        self._waiting_for: set[ActionLabel] = set([])
+        self._waiting_for: dict[ActionLabel, int] = {}
         self.directory = label[0].absolute()
         self.name = label[1]
         self.full_path = self.directory / self.name
@@ -687,11 +687,15 @@ class ActionBase(ActionInvoker):
             f"write_waiting_for {self.label} to {self.waiting_for_file}: {self._waiting_for}"
         )
         with self.waiting_for_file.open("w") as f:
-            f.writelines([f"{str(l[0])}/{l[1]}" for l in self._waiting_for])
+            for l, c in self._waiting_for.items():
+                json.dump({"label": (str(l[0]), l[1]), "count": c}, f)
 
-    def _read_waiting_for(self) -> set[ActionLabel]:
+    def _read_waiting_for(self) -> dict[ActionLabel, int]:
         with self.waiting_for_file.open("r") as f:
-            self._waiting_for = set([label_from_line(l) for l in f.readlines()])
+            for line in f.readlines():
+                js = json.loads(line)
+                label = (Path(js["label"][0]), js["label"][1])
+                self._waiting_for[label] = int(js["count"])
 
         return self._waiting_for
 
@@ -713,7 +717,11 @@ class ActionBase(ActionInvoker):
             def __enter__(this):
                 with self.get_status_lock_file():
                     self._read_waiting_for()
-                    self._waiting_for.add(label)
+                    if label in self._waiting_for:
+                        self._waiting_for[label] += 1
+                    else:
+                        self._waiting_for[label] = 1
+
                     self._write_waiting_for()
                 return this
 
@@ -726,7 +734,10 @@ class ActionBase(ActionInvoker):
                 with self.get_status_lock_file():
                     self._read_waiting_for()
                     assert label in self._waiting_for
-                    self._waiting_for.remove(label)
+                    assert self._waiting_for[label] > 0
+                    self._waiting_for[label] -= 1
+                    if self._waiting_for[label] <= 0:
+                        self._waiting_for.pop(label)
                     self._write_waiting_for()
 
         return WaitingFor()
@@ -774,7 +785,7 @@ class BasicAction(ActionBase):
         self.status = StatusEnum.RUNNING
         self.write_status()
 
-        (action_dir(self.label) / "subbbuild_faild").unlink(missing_ok=True)
+        (action_dir(self.label) / "subbuild_failed").unlink(missing_ok=True)
 
         mountpoint = self.storage / "mountpoint"
         logger.info(f"{mountpoint=}")
@@ -789,7 +800,7 @@ class BasicAction(ActionBase):
         logger.debug(f"{writeable=}")
         writeable.mkdir(parents=True, exist_ok=True)
         cwd = self.directory.absolute()
-        (action_dir(self.label) / "subbuild_faild").unlink(missing_ok=True)
+        (action_dir(self.label) / "subbuild_failed").unlink(missing_ok=True)
         if len(list(mountpoint.iterdir())) > 0:
             logger.error(f"{mountpoint} not empty:  {list(mountpoint.iterdir())=}")
             assert False
@@ -844,53 +855,61 @@ class BasicAction(ActionBase):
             )
 
             try:
-
                 logger.info(f"{spawn_cmd=}  {spawn_env=}")
-                self.build_process = psutil.Popen(spawn_cmd, env=spawn_env)
-                logger.debug(
-                    f"Build process for {self.label} is {self.build_process.pid=}"
-                )
-                assert self.build_process is not None
-                subbuild_failed = False
-                subbuild_failed_file = action_dir(self.label) / "subbuild_faild"
-                while True:
-                    logger.debug(
-                        f"Waiting for cmd for {self.label} to finish {self.build_process.pid=}"
-                    )
-                    procs = [
-                        self.build_process,
-                        self.fuse_mount,
-                    ]
-                    gone, alive = psutil.wait_procs(procs, timeout=1.0)
-                    if self.build_process in gone:
-                        self.action_setup_record.return_code = (
-                            self.build_process.returncode
+                with (self.storage / "stderr").open("wb") as err_file:
+                    with (self.storage / "stdout").open("wb") as out_file:
+                        self.build_process = psutil.Popen(
+                            spawn_cmd, env=spawn_env, stderr=err_file, stdout=out_file
                         )
-                        logger.info(
-                            f"Running command for {self.label} finished {self.action_setup_record.return_code=}"
+                        logger.debug(
+                            f"Build process for {self.label} is {self.build_process.pid=}"
                         )
-                        self.build_process = None
-                        break
-                    if self.fuse_mount in gone:
-                        logger.error(
-                            f"Fuse mount exited too early with return code {self.fuse_mount.returncode}"
+                        assert self.build_process is not None
+                        subbuild_failed = False
+                        subbuild_failed_file = (
+                            action_dir(self.label) / "subbuild_failed"
                         )
-                        self.action_setup_record.return_code = -1
-                        self.fuse_mount = None
-                        kill_subprocess(self.build_process)
-                        break
-                    subbuild_failed = subbuild_failed_file.exists()
-                    if subbuild_failed and self.build_process is not None:
-                        logger.info(
-                            f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}"
-                        )
-                        kill_subprocess(self.build_process)
-                    if subbuild_failed and self.action_setup_record.return_code is None:
-                        logger.info(
-                            f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}, setting return code to -1"
-                        )
+                        while True:
+                            logger.debug(
+                                f"Waiting for cmd for {self.label} to finish {self.build_process.pid=}"
+                            )
+                            procs = [
+                                self.build_process,
+                                self.fuse_mount,
+                            ]
+                            gone, alive = psutil.wait_procs(procs, timeout=1.0)
+                            if self.build_process in gone:
+                                self.action_setup_record.return_code = (
+                                    self.build_process.returncode
+                                )
+                                logger.info(
+                                    f"Running command for {self.label} finished {self.action_setup_record.return_code=}"
+                                )
+                                self.build_process = None
+                                break
+                            if self.fuse_mount in gone:
+                                logger.error(
+                                    f"Fuse mount exited too early with return code {self.fuse_mount.returncode}"
+                                )
+                                self.action_setup_record.return_code = -1
+                                self.fuse_mount = None
+                                kill_subprocess(self.build_process)
+                                break
+                            subbuild_failed = subbuild_failed_file.exists()
+                            if subbuild_failed and self.build_process is not None:
+                                logger.info(
+                                    f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}"
+                                )
+                                kill_subprocess(self.build_process)
+                            if (
+                                subbuild_failed
+                                and self.action_setup_record.return_code is None
+                            ):
+                                logger.info(
+                                    f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}, setting return code to -1"
+                                )
 
-                        self.action_setup_record.return_code = -1
+                                self.action_setup_record.return_code = -1
             except Exception as e:
                 logger.error(
                     f"Something went wrong when spawning {self.directory} / {self.name}: {e=}"
@@ -912,12 +931,6 @@ class BasicAction(ActionBase):
             if subbuild_failed:
                 logger.info("Return code == 0 but subbuild failed")
                 self.action_setup_record.return_code = -1
-                failed_action = subbuild_failed_file.read_text().strip()
-
-                print(
-                    f"{self.label} failed because {failed_action} failed",
-                    file=sys.stderr,
-                )
 
             assert self.action_setup_record.return_code is not None
             self.mark_as_done(self.action_setup_record.return_code)
@@ -971,7 +984,7 @@ class BasicAction(ActionBase):
             ):
                 status = Status(StatusEnum.REQUIRING)
                 self._write_status(status)
-                self._waiting_for = set([])
+                self._waiting_for.clear()
                 self._write_waiting_for()
                 return True, status
             else:

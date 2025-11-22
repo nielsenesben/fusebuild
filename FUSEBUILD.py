@@ -7,6 +7,12 @@ print(f"Loading {__file__}")
 action(name="xeyes", cmd=["xeyes"], category="demo")
 
 shell_action(
+    name="depend_on_xeyes",
+    cmd="test ! -f $OUTPUT_DIR/../xeyes/nonexistantfile",
+    category="demo",
+)
+
+shell_action(
     name="venv",
     cmd="\n".join(
         [
