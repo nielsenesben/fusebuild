@@ -21,7 +21,7 @@ import fuse  # type: ignore
 from fuse import Fuse, FuseArgs, FuseError
 
 
-def main(label: ActionLabel):
+def main(label: ActionLabel) -> int:
     schema = marshmallow_dataclass2.class_schema(Action)()
     action_dir_ = action_dir(label)
     action_file = (
@@ -69,6 +69,7 @@ def main(label: ActionLabel):
         access_recorder.flush()
 
     logger.info(f"mountview for {label} done")
+    return 0
 
 
 if __name__ == "__main__":

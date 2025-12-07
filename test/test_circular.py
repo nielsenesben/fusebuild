@@ -22,7 +22,7 @@ logger = getLogger(__name__)
 class TestCircular(TestCase):
     tempdir = tempfile.TemporaryDirectory()
 
-    def setUp(self):
+    def setUp(self) -> None:
         ## First copy the test project to a tmp working dir
         self.workdir = Path(self.tempdir.name) / "circular"
         if self.workdir.exists():
@@ -31,7 +31,7 @@ class TestCircular(TestCase):
         ret = shutil.copytree(Path(__file__).parent / "test_circular", self.workdir)
         self.assertEqual(ret, self.workdir)
 
-    def test_build_circular(self):
+    def test_build_circular(self) -> None:
         ret = subprocess.run(
             [
                 "python3",
@@ -84,7 +84,7 @@ shell_action(
 
         # Now reintroduce the issue
         (self.workdir / "FUSEBUILD.py").unlink()
-        ret = shutil.copyfile(
+        ret_copyfile = shutil.copyfile(
             Path(__file__).parent / "test_circular" / "FUSEBUILD.py",
             self.workdir / "FUSEBUILD.py",
         )
@@ -99,7 +99,7 @@ shell_action(
         )
         self.assertEqual(ret.returncode, 1)
 
-    def test_build_circular_from_out_of_circle(self):
+    def test_build_circular_from_out_of_circle(self) -> None:
         ret = subprocess.run(
             [
                 "python3",
@@ -111,7 +111,7 @@ shell_action(
         )
         self.assertEqual(ret.returncode, 1)
 
-    def test_circular_fusebuild_files(self):
+    def test_circular_fusebuild_files(self) -> None:
         # Avoid original error
         (self.workdir / "FUSEBUILD.py").write_text("")
         (self.workdir / "subA").mkdir()

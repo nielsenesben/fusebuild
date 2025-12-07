@@ -34,7 +34,7 @@ from pathlib import Path
 from stat import *
 from threading import Lock, Thread
 from types import TracebackType
-from typing import Any, Iterable, Optional, Protocol
+from typing import Any, Iterable, Optional, Protocol, Tuple, Union
 
 import filelock
 import marshmallow_dataclass2
@@ -101,13 +101,13 @@ def os_environ() -> dict[str, str]:
     return {k: os.environ[k] for k in os.environ}
 
 
-def check_pid(pid):
+def check_pid(pid: int) -> bool:
     """Check For the existence of a unix pid."""
     psutil.process_iter.cache_clear()
     return psutil.pid_exists(pid)
 
 
-def kill_subprocess(process: subprocess.Popen | psutil.Popen):
+def kill_subprocess(process: subprocess.Popen | psutil.Popen) -> None:
     pid = process.pid
 
     if not check_pid(pid):
@@ -145,7 +145,7 @@ def kill_subprocess(process: subprocess.Popen | psutil.Popen):
         logger.warning(f"Failed to send sigkill to {pid=}:  {type(e)=}  {e}")
 
 
-def flag2mode(flags):
+def flag2mode(flags: int) -> str:
     md = {os.O_RDONLY: "rb", os.O_WRONLY: "wb", os.O_RDWR: "wb+"}
     m = md[flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)]
 
@@ -251,9 +251,9 @@ class BasicMount(Fuse):
         access_recorder: AccessRecorder,
         writeable: str,
         mappings: list[MappingDefinition] = [],
-        *args,
-        **kw,
-    ):
+        *args: Any,
+        **kw: Any,
+    ) -> None:
         self.label = label
         self.invoker = invoker
         self.fuse_args = FuseArgs()
@@ -270,7 +270,7 @@ class BasicMount(Fuse):
         self.mappings = [m.create(output_folder_root) for m in mappings]
         logger.debug(f"{self.mappings=}")
 
-    def is_rule_output(self, path):
+    def is_rule_output(self, path: Path | str) -> bool:
         return is_rule_output(path)
 
     def handle_other_rule_output(self, path: str) -> None:
@@ -305,7 +305,7 @@ class BasicMount(Fuse):
 
             self.access_recorder.listener()
 
-    def is_writeable(self, path):
+    def is_writeable(self, path: str) -> bool:
         res = os.path.commonprefix([self.writeable, path]) == self.writeable
         logger.debug(f"is_writeable {path}: {res}")
         if False:
@@ -333,8 +333,8 @@ class BasicMount(Fuse):
             self.handle_other_rule_output(path_str)
         return path_str, is_output
 
-    def getattr(self, path):
-        path, is_output = self.common_handle_path(path)
+    def getattr(self, path_in: Path) -> os.stat_result:
+        path, is_output = self.common_handle_path(path_in)
         res = os.lstat("." + path)
         logger.debug(f"getattr {path} {res}")
         if not self.is_writeable(path):
@@ -344,15 +344,16 @@ class BasicMount(Fuse):
 
         return res
 
-    def readlink(self, path):
-        path, is_output = self.common_handle_path(path)
+    def readlink(self, path_in: Path) -> str:
+        path: str
+        path, is_output = self.common_handle_path(path_in)
         res = os.readlink("." + path)
         if not self.is_writeable(path):
             self.access_recorder.record_readlink(path, res)
         return res
 
-    def readdir(self, path, offset):
-        path, is_output = self.common_handle_path(path)
+    def readdir(self, path_in: Path, offset: int) -> Iterable[os.DirEntry]:
+        path, is_output = self.common_handle_path(path_in)
         logger.debug(f"readdir {path} {offset}")
         to_record = []
         for e in os.listdir("." + path):
@@ -362,72 +363,76 @@ class BasicMount(Fuse):
         if not self.is_writeable(path):
             self.access_recorder.record_readdir(path, to_record)
 
-    def unlink(self, path):
-        path, is_output = self.remap(path)
+    def unlink(self, path_in: Path) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"unlink {path}")
         if self.is_writeable(path):
             os.unlink("." + path)
 
-    def rmdir(self, path):
-        path, is_output = self.remap(path)
+    def rmdir(self, path_in: Path) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"rmdir {path}")
         if self.is_writeable(path):
             os.rmdir("." + path)
 
-    def symlink(self, path, path1):
-        path, is_output = self.remap(path)
-        path1, is_putput1 = self.remap(path1)
+    def symlink(self, path_in: Path, path1_in: Path) -> None:
+        path, is_output = self.remap(path_in)
+        path1, is_putput1 = self.remap(path1_in)
         if self.is_writeable(path1):
             os.symlink(path, "." + path1)
 
-    def rename(self, path, path1):
-        path, is_output = self.remap(path)
-        path1, is_output1 = self.remap(path1)
+    def rename(self, path_in: Path, path1_in: Path) -> None:
+        path, is_output = self.remap(path_in)
+        path1, is_output1 = self.remap(path1_in)
         logger.debug(f"rename {path} {path1}")
         if self.is_writeable(path) and self.is_writeable(path1):
             os.rename("." + path, "." + path1)
 
-    def link(self, path, path1):
-        path, is_output = self.remap(path)
-        path1, is_output1 = self.remap(path1)
+    def link(self, path_in: Path, path1_in: Path) -> None:
+        path, is_output = self.remap(path_in)
+        path1, is_output1 = self.remap(path1_in)
         logger.debug(f"link {path} {path1}")
         if self.is_writeable(path1):
             os.link("." + path, "." + path1)
 
-    def chmod(self, path, mode):
-        path, is_output = self.remap(path)
+    def chmod(self, path_in: Path, mode: int) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"rename {path} {mode}")
         if self.is_writeable(path):
             os.chmod("." + path, mode)
 
-    def chown(self, path, user, group):
-        path, is_output = self.remap(path)
+    def chown(self, path_in: Path, user: int, group: int) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"chown {path} {user} {group}")
         if self.is_writeable(path):
             os.chown("." + path, user, group)
 
-    def truncate(self, path, len):
-        path, is_output = self.remap(path)
+    def truncate(self, path_in: Path, len: int) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"truncate {path} {len}")
         if self.is_writeable(path):
             f = open("." + path, "a")
             f.truncate(len)
             f.close()
 
-    def mknod(self, path, mode, dev):
-        path, is_output = self.remap(path)
+    def mknod(self, path_in: Path, mode: int, dev: int) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"mknod {path} {mode} {dev}")
         if self.is_writeable(path):
             os.mknod("." + path, mode, dev)
 
-    def mkdir(self, path, mode):
-        path, is_output = self.remap(path)
+    def mkdir(self, path_in: Path, mode: int) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"mkdir {path} {mode}")
         if self.is_writeable(path):
             os.mkdir("." + path, mode)
 
-    def utime(self, path, times):
-        path, is_output = self.remap(path)
+    def utime(
+        self,
+        path_in: Path,
+        times: Optional[Union[Tuple[int, int], Tuple[float, float]]],
+    ) -> None:
+        path, is_output = self.remap(path_in)
         logger.debug(f"utime {path} {times}")
         if self.is_writeable(path):
             os.utime("." + path, times)
@@ -439,8 +444,8 @@ class BasicMount(Fuse):
     #    def utimens(self, path, ts_acc, ts_mod):
     #      os.utime("." + path, (ts_acc.tv_sec, ts_mod.tv_sec))
 
-    def access(self, path, mode):
-        path, is_output = self.common_handle_path(path)
+    def access(self, path_in: Path, mode: int) -> int:
+        path, is_output = self.common_handle_path(path_in)
         os_res = os.access("." + path, mode)
         if not self.is_writeable(path):
             self.access_recorder.record_access(path, mode, os_res)
@@ -471,7 +476,7 @@ class BasicMount(Fuse):
     #            return len("".join(aa)) + len(aa)
     #        return aa
 
-    def statfs(self):
+    def statfs(self) -> os.statvfs_result:
         """
         Should return an object with statvfs attributes (f_bsize, f_frsize...).
         Eg., the return value of os.statvfs() is such a thing (since py 2.2).
@@ -492,12 +497,12 @@ class BasicMount(Fuse):
 
         return os.statvfs(".")
 
-    def fsinit(self):
+    def fsinit(self) -> None:
         os.chdir(self.root)
 
-    def main(self_outer):
+    def main(self_outer) -> int:
         class BasicFile(object):
-            def __init__(self, path_in, flags, *mode):
+            def __init__(self, path_in: Path, flags: int, *mode: int) -> None:
                 write_flags = (
                     os.O_WRONLY
                     | os.O_RDWR
@@ -525,7 +530,7 @@ class BasicMount(Fuse):
                 else:
                     self.iolock = Lock()
 
-            def read(self, length, offset):
+            def read(self, length: int, offset: int) -> bytes:
                 if self.iolock:
                     self.iolock.acquire()
                     try:
@@ -536,7 +541,7 @@ class BasicMount(Fuse):
                 else:
                     return os.pread(self.fd, length, offset)
 
-            def write(self, buf, offset):
+            def write(self, buf: bytes, offset: int) -> int:
                 if not self_outer.is_writeable(self.path):
                     return -EACCES
 
@@ -552,17 +557,17 @@ class BasicMount(Fuse):
                 else:
                     return os.pwrite(self.fd, buf, offset)
 
-            def release(self, flags):
+            def release(self, flags: int) -> None:
                 self.file.close()
 
-            def _fflush(self):
+            def _fflush(self) -> None:
                 logger.debug(f"_fflush {self.path=} {self.file.mode=}")
                 if (
                     "w" in self.file.mode or "a" in self.file.mode
                 ) and self_outer.is_writeable(self.path):
                     self.file.flush()
 
-            def fsync(self, isfsyncfile):
+            def fsync(self, isfsyncfile: bool) -> Any:
                 if not self_outer.is_writeable(self.path):
                     return -EACCES
 
@@ -572,22 +577,22 @@ class BasicMount(Fuse):
                 else:
                     os.fsync(self.fd)
 
-            def flush(self):
+            def flush(self) -> None:
                 self._fflush()
                 # cf. xmp_flush() in fusexmp_fh.c
                 os.close(os.dup(self.fd))
 
-            def fgetattr(self):
+            def fgetattr(self) -> os.stat_result:
                 return os.fstat(self.fd)
 
-            def ftruncate(self, len):
+            def ftruncate(self, len: int) -> Any:
                 logger.debug("ftruncate {self.path=} {len=}")
                 if not self_outer.is_writeable(self.path):
                     return -EACCES
 
                 self.file.truncate(len)
 
-            def lock(self, cmd, owner, **kw):
+            def lock(self, cmd: int, owner: int, **kw: Any) -> Any:
                 # The code here is much rather just a demonstration of the locking
                 # API than something which actually was seen to be useful.
 
@@ -682,10 +687,10 @@ class ActionBase(ActionInvoker):
         return [str(self.label.path), self.label.name]
 
     @property
-    def waiting_for_file(self):
+    def waiting_for_file(self) -> Path:
         return self.storage / "waiting_for"
 
-    def _write_waiting_for(self):
+    def _write_waiting_for(self) -> None:
         logger.debug(
             f"write_waiting_for {self.label} to {self.waiting_for_file}: {self._waiting_for}"
         )
@@ -717,7 +722,7 @@ class ActionBase(ActionInvoker):
 
     def waiting_for(self, label: ActionLabel) -> AbstractContextManager:
         class WaitingFor:
-            def __enter__(this):
+            def __enter__(this) -> "WaitingFor":
                 with self.get_status_lock_file():
                     self._read_waiting_for()
                     if label in self._waiting_for:
@@ -759,7 +764,7 @@ class BasicAction(ActionBase):
         return Path(output_folder_root_str + str(self.full_path))
 
     @property
-    def action(self):
+    def action(self) -> Action:
         return self.action_setup_record.definition
 
     @property
@@ -983,6 +988,7 @@ class BasicAction(ActionBase):
             if (
                 not status
                 or status.status == StatusEnum.DONE
+                or status.running_pid is None
                 or not check_pid(status.running_pid)
             ):
                 status = Status(StatusEnum.REQUIRING)
@@ -1150,7 +1156,7 @@ def check_deadlock_inner(
         status = action._read_status()
         if status is None or status.status == StatusEnum.DONE:
             return []
-        if not check_pid(status.running_pid):
+        if not status.running_pid or not check_pid(status.running_pid):
             return []
 
         for l in action._read_waiting_for():
@@ -1213,7 +1219,7 @@ class RuleAction(BasicAction):
         super(RuleAction, self).__init__(label, action)
 
 
-def clean_nonexisting_action(path: Path, name: str):
+def clean_nonexisting_action(path: Path, name: str) -> None:
     logger.info(f"Clean non-exsisting target {path}/{name}")
     empty_action = Action(cmd=[], category="internal_clean")
     action = RuleAction(ActionLabel(path, name), empty_action)

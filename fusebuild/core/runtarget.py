@@ -14,12 +14,6 @@ logger = getLogger(__name__)
 # logging.basicConfig(level=logging.DEBUG)
 
 
-def _check_for_deadlock(
-    status: Status, target: tuple[Path, str], try_to_lock_all
-) -> bool:
-    return False
-
-
 def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | None:
     # os.setpgrp()
     logger.debug(f"Runtarget {buildfile=} {target=}")

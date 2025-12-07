@@ -3,10 +3,10 @@ from absl.testing.absltest import TestCase  # type: ignore
 
 
 class TestAccessLog(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         pass
 
-    def test_readlink(self):
+    def test_readlink(self) -> None:
         pass
 
 

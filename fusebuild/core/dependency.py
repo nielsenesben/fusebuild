@@ -79,7 +79,7 @@ def store_hash(record_path: str, stat: os.stat_result, hash: str) -> None:
     _hashed[record_path] = (stat_result_to_record(stat), hash)
 
 
-def _file_hash(path: str | Path, stat: os.stat_result):
+def _file_hash(path: str | Path, stat: os.stat_result) -> str:
     if isinstance(path, Path):
         path = str(path)
 

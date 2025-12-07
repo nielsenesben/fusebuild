@@ -15,7 +15,7 @@ logger = getLogger(__name__)
 class TestExample2(TestCase):
     tempdir = tempfile.TemporaryDirectory()
 
-    def setUp(self):
+    def setUp(self) -> None:
         ## First copy the test project to a tmp working dir
         self.workdir = Path(self.tempdir.name) / "example2"
         if self.workdir.exists():
@@ -24,7 +24,7 @@ class TestExample2(TestCase):
         ret = shutil.copytree(Path(__file__).parent / "test_example2", self.workdir)
         self.assertEqual(ret, self.workdir)
 
-    def test_depend_on_action_in_parent(self):
+    def test_depend_on_action_in_parent(self) -> None:
         output_file = (
             Path(str(output_folder_root) + str(self.workdir))
             / "subdir"

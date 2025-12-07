@@ -14,7 +14,7 @@ class ActionInvoker(Protocol):
 class DummyInvoker(ActionInvoker):
     def waiting_for(self, label: ActionLabel) -> AbstractContextManager:
         class WaitingFor:
-            def __enter__(this):
+            def __enter__(this) -> "WaitingFor":
                 return this
 
             def __exit__(
@@ -27,5 +27,5 @@ class DummyInvoker(ActionInvoker):
 
         return WaitingFor()
 
-    def runtarget_args(self):
+    def runtarget_args(self) -> list[str]:
         return []

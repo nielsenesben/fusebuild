@@ -19,7 +19,7 @@ from fusebuild.core.logger import getLogger
 logger = getLogger(__name__)
 
 
-def create_tcp_server():
+def create_tcp_server() -> socket.socket:
     # Create a TCP/IP socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -36,7 +36,7 @@ def create_tcp_server():
 class TestExample1(TestCase):
     tempdir = tempfile.TemporaryDirectory()
 
-    def setUp(self):
+    def setUp(self) -> None:
         ## First copy the test project to a tmp working dir
         self.workdir = Path(self.tempdir.name) / "example1"
         if self.workdir.exists():
@@ -45,7 +45,7 @@ class TestExample1(TestCase):
         ret = shutil.copytree(Path(__file__).parent / "test_example1", self.workdir)
         self.assertEqual(ret, self.workdir)
 
-    def test_rebuilding(self):
+    def test_rebuilding(self) -> None:
         output_file = (
             Path(str(output_folder_root) + str(self.workdir))
             / "copyfile"
@@ -132,7 +132,7 @@ class TestExample1(TestCase):
         self.assertGreaterEqual(len(deps), 1)
         self.assertTrue(ActionLabel(self.workdir, "nonexistant_rule") in deps)
 
-    def test_failed_action(self):
+    def test_failed_action(self) -> None:
         self.assertTrue(self.workdir.exists())
         subprocess.run(["ls", str(self.workdir)])
         ret = subprocess.run(
@@ -146,7 +146,7 @@ class TestExample1(TestCase):
         )
         self.assertEqual(ret.returncode, 1)
 
-    def test_handle_change_to_input_under_build(self):
+    def test_handle_change_to_input_under_build(self) -> None:
         with create_tcp_server() as sock:
             print(f"{sock=}")
             _, port = sock.getsockname()

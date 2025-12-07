@@ -63,7 +63,7 @@ class AccessRecorder:
         self.action_deps = set(load_action_deps(self.action_deps_file))
         self.mutex = Lock()
 
-    def _report_change(self):
+    def _report_change(self) -> None:
         self.listener()
 
     def _record_path(self, path: str | Path) -> tuple[bool, str]:
@@ -111,7 +111,7 @@ class AccessRecorder:
             DependencyIndex(self._record_path(path), AccessType.ACCESS, mode), res
         )
 
-    def record_stat(self, path, res: os.stat_result) -> None:
+    def record_stat(self, path: str, res: os.stat_result) -> None:
         self.write_entry(
             DependencyIndex(self._record_path(path), AccessType.STAT),
             self._stat_records(res),
@@ -150,7 +150,7 @@ class AccessRecorder:
                 DependencyIndex((is_output, record_path), AccessType.READ), hash
             )
 
-    def record_readlink(self, path: Path, res: str) -> None:
+    def record_readlink(self, path: Path | str, res: str) -> None:
         is_output, record_path = self._record_path(path)
         if not is_output:
             self.write_entry(
@@ -176,7 +176,7 @@ class AccessRecorder:
         logger.debug(f"{expected=} {actual=}")
         return actual == expected
 
-    def flush(self):
+    def flush(self) -> None:
         with self.action_deps_file.open("w") as f:
             for ad in self.action_deps:
                 f.write(f"{ad}\n")
@@ -266,7 +266,7 @@ def check_accesses_inner_loop(
     return matches
 
 
-def merge_access_logs(label: ActionLabel):
+def merge_access_logs(label: ActionLabel) -> None:
     action_dir_ = action_dir(label)
     access_log = access_log_file(label)
     new_access_log = new_access_log_file(label)

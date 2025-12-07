@@ -12,6 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 
 import filelock
 import psutil
@@ -49,7 +50,7 @@ def copy_file_to_stderr(name: Path) -> None:
             sys.stderr.buffer.write(data)
 
 
-def print_output(label: ActionLabel):
+def print_output(label: ActionLabel) -> None:
     stderr_out = action_dir(label) / "stderr"
     if stderr_out.exists():
         print(f"Stderr of {label}:", file=sys.stderr)
@@ -139,7 +140,7 @@ def main_inner(args: list[str]) -> int:
 
     graph: dict[ActionLabel, list[ActionLabel]] = {}
 
-    def helper(l: ActionLabel):
+    def helper(l: ActionLabel) -> None:
         deps = load_action_deps(l)
         graph[l] = deps
         logger.debug(f"Graph {l}: {deps}")
@@ -195,7 +196,7 @@ def main_inner(args: list[str]) -> int:
     return 0
 
 
-def kill_process(process: psutil.Process, signal: int, tmp_dir: str):
+def kill_process(process: psutil.Process, signal: int, tmp_dir: str) -> None:
     logger.info(f"Killing {process.pid} with {signal=}")
     try:
         env = process.environ()
@@ -215,7 +216,7 @@ def kill_process(process: psutil.Process, signal: int, tmp_dir: str):
         logger.debug(f"Process {process.pid} already gone")
 
 
-def kill_recursive(process: psutil.Process, signal: int, tmp_dir: str):
+def kill_recursive(process: psutil.Process, signal: int, tmp_dir: str) -> None:
     for c in process.children():
         kill_recursive(c, signal, tmp_dir)
         kill_process(c, signal, tmp_dir)
@@ -228,7 +229,9 @@ def status(p: psutil.Process) -> str:
         return "gone"
 
 
-def signal_handler(tmp_dir: str, signumber: int, frame=None) -> None:
+def signal_handler(
+    tmp_dir: str, signumber: int, frame: Any = None
+) -> None:  # TODO: type of frame
     logger.info(f"Got signal {signumber}")
     children = psutil.Process().children(recursive=True)
     for c in children:
