@@ -4,7 +4,7 @@ from pathlib import Path
 from fusebuild import PatternRemapToOutput, shell_action, top_output_dir, topdir
 
 
-def pyc_actions(t: Path = topdir(Path("."))):
+def pyc_actions(t: Path = topdir(Path("."))) -> None:
     shell_action(name="pycache_gen_dir", cmd="true")
 
     pyfiles = glob("**/*.py") + glob("*.py")

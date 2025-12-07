@@ -5,7 +5,7 @@ from fusebuild import shell_action, top_output_dir
 from fusebuild.python.pyc import pyc_mappings
 
 
-def mypy_actions():
+def mypy_actions() -> None:
     pyfiles = glob("*.py")
     for p in pyfiles:
         shell_action(
