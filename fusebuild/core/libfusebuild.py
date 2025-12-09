@@ -1031,7 +1031,7 @@ class BasicAction(ActionBase):
         return self.storage / "last_definition.json"
 
     def needs_rebuild(self, reason: str) -> Result[bool, bool]:
-        if (self.directory, self.name) in dependencies_ok:
+        if self.label in dependencies_ok:
             logger.debug(f"({self.directory}, {self.name}) in dependencies_ok")
             return Ok(False)
         if FUSEBUILD_INVOCATION_DIR in os.environ:
