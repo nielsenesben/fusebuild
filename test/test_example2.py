@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from absl.testing.absltest import TestCase, main  # type: ignore
+from absl.testing.absltest import TestCase, main
 
 from fusebuild import output_folder_root
 from fusebuild.core.logger import getLogger

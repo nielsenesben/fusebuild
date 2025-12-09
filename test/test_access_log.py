@@ -1,5 +1,5 @@
 import fuse  # type: ignore
-from absl.testing.absltest import TestCase  # type: ignore
+from absl.testing.absltest import TestCase
 
 
 class TestAccessLog(TestCase):
