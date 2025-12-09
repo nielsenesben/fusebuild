@@ -20,11 +20,11 @@ action_folder_root_str = str(action_folder_root)
 
 
 def action_dir(label: ActionLabel):
-    return Path(action_folder_root_str + str(label[0])) / label[1]
+    return Path(action_folder_root_str + str(label.path)) / label.name
 
 
 def output_dir(label: ActionLabel):
-    return Path(output_folder_root_str + str(label[0])) / label[1]
+    return Path(output_folder_root_str + str(label.path)) / label.name
 
 
 def is_rule_output(path: str) -> bool:

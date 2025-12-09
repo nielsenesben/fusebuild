@@ -156,7 +156,7 @@ def main_inner(args: list[str]) -> int:
     sorted_actions = sort_graph(graph)
     logger.info(f"{sorted_actions=}")
     for label in sorted_actions:
-        rule_action = get_rule_action(label[0], label[1], invoker)
+        rule_action = get_rule_action(label.path, label.name, invoker)
         if rule_action is None:
             if label in targets:
                 print(f"Can't find action for {label}", file=sys.stderr)
@@ -166,7 +166,7 @@ def main_inner(args: list[str]) -> int:
                 logger.info(f"Old dependency to now missing action {label}")
                 continue
 
-        print(f"{str(label[0])}/{label[1]}....", end="")
+        print(f"{label}....", end="")
         needs_rebuild_result = rule_action.needs_rebuild("from main loop")
         rule_action.release_lock()
         match needs_rebuild_result:
@@ -182,7 +182,7 @@ def main_inner(args: list[str]) -> int:
             case _:
                 assert False
 
-        res = run_action(label[0], label[1], invoker)
+        res = run_action(label.path, label.name, invoker)
         if res != 0:
             print(".. failed")
             if label in targets:

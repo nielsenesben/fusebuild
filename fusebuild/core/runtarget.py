@@ -5,6 +5,7 @@ import time
 import uuid
 from pathlib import Path
 
+from fusebuild.core.action import ActionLabel
 from fusebuild.core.action_invoker import ActionInvoker, DummyInvoker
 from fusebuild.core.libfusebuild import ActionBase, Status, get_rule_action
 from fusebuild.core.logger import getLogger
@@ -36,7 +37,7 @@ def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | No
 if __name__ == "__main__":
     invoker: ActionInvoker
     if len(sys.argv) > 3:
-        invoker = ActionBase((Path(sys.argv[3]), sys.argv[4]))
+        invoker = ActionBase(ActionLabel(Path(sys.argv[3]), sys.argv[4]))
     else:
         invoker = DummyInvoker()
     sys.exit(_runtarget(Path(sys.argv[1]), sys.argv[2], invoker))

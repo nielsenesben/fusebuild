@@ -163,7 +163,13 @@ class ProtocolList(fields.Field):
         return res
 
 
-ActionLabel: TypeAlias = tuple[Path, str]
+@dataclass(frozen=True)
+class ActionLabel:
+    path: Path
+    name: str
+
+    def __str__(self) -> str:
+        return f"{str(self.path)}/{self.name}"
 
 
 class Mapping(Protocol):
@@ -269,4 +275,4 @@ class ActionStatus:
 def label_from_line(line: str):
     """Assumes action names doesn't contain / - might change"""
     last_slash = line.rfind("/")
-    return (Path(line[0:last_slash]), line[last_slash + 1 :].rstrip())
+    return ActionLabel(Path(line[0:last_slash]), line[last_slash + 1 :].rstrip())

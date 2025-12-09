@@ -5,7 +5,7 @@ from pathlib import Path
 
 import marshmallow_dataclass2
 
-from .action import Action, BwrapSandbox, TmpDir, TmpStrategy
+from .action import Action, ActionLabel, BwrapSandbox, TmpDir, TmpStrategy
 from .file_layout import output_dir, output_folder_root_str
 from .libfusebuild import load_action_file, loaded_actions
 from .logger import getLogger
@@ -25,7 +25,7 @@ def _action(name: str, cmd: list[str], **kwargs) -> Action:
         else:
             frame = frame.f_back
 
-    label = (directory, name)
+    label = ActionLabel(directory, name)
 
     if "tmp" in kwargs:
         tmp = kwargs["tmp"]
@@ -69,9 +69,11 @@ def shell_action(name: str, cmd: str, **kwargs) -> Action:
 
 def write_actions():
     schema = marshmallow_dataclass2.class_schema(Action)()
-    for (path, name), action in loaded_actions.items():
+    for label, action in loaded_actions.items():
         action_path = Path(
-            output_folder_root_str + str(path / "FUSEBUILD.py" / name) + ".json"
+            output_folder_root_str
+            + str(label.path / "FUSEBUILD.py" / label.name)
+            + ".json"
         )
         action_path.parent.mkdir(parents=True, exist_ok=True)
         logger.debug(f"{action_path=}")
@@ -81,9 +83,10 @@ def write_actions():
 
 def get_action(path: Path | str, name: str) -> Action:
     path = Path(path).absolute()
-    if (path, name) in loaded_actions:
-        return loaded_actions[(path, name)]
+    label = ActionLabel(path, name)
+    if label in loaded_actions:
+        return loaded_actions[label]
     action = load_action_file(
-        (path, name), output_dir((path, "FUSEBUILD.py")) / f"{name}.json"
+        label, output_dir(ActionLabel(path, "FUSEBUILD.py")) / f"{name}.json"
     )
     return action
