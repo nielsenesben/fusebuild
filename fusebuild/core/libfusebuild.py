@@ -179,7 +179,7 @@ def run_action(directory: Path, target: str, invoker: ActionInvoker) -> int:
 
 
 # Once a dependency is checked in an invocation, it stays ok
-dependencies_ok: dict[tuple[Path, str], bool] = {}
+dependencies_ok: dict[ActionLabel, bool] = {}
 
 
 def check_build_target(
@@ -198,7 +198,7 @@ def check_build_target(
         if src_dir == Path("/"):
             return True, None
 
-    label = (src_dir, target)
+    label = ActionLabel(src_dir, target)
 
     if label in dependencies_ok:
         logger.debug(f"{label} was in dependencies_ok")
@@ -301,7 +301,7 @@ class BasicMount(Fuse):
                     if label is None:
                         f.write("something odd")
                     else:
-                        f.write(f"{label[0]}/{label[1]}\n")
+                        f.write(f"{label}\n")
 
             self.access_recorder.listener()
 
@@ -664,19 +664,22 @@ class Status:
 class ActionBase(ActionInvoker):
     def __init__(self, label: ActionLabel):
         self._waiting_for: dict[ActionLabel, int] = {}
-        self.directory = label[0].absolute()
-        self.name = label[1]
+        self.label = label
         self.full_path = self.directory / self.name
         logger.debug(f"{self.full_path=}")
         self.storage = fusebuild_folder / ("actions" + str(self.full_path))
         logger.debug(f"{self.storage=}")
 
     @property
-    def label(self):
-        return (self.directory, self.name)
+    def directory(self) -> Path:
+        return self.label.path
+
+    @property
+    def name(self) -> str:
+        return self.label.name
 
     def runtarget_args(self) -> list[str]:
-        return [self.label[0], self.label[1]]
+        return [str(self.label.path), self.label.name]
 
     @property
     def waiting_for_file(self):
@@ -688,13 +691,13 @@ class ActionBase(ActionInvoker):
         )
         with self.waiting_for_file.open("w") as f:
             for l, c in self._waiting_for.items():
-                json.dump({"label": (str(l[0]), l[1]), "count": c}, f)
+                json.dump({"label": (str(l.path), l.name), "count": c}, f)
 
     def _read_waiting_for(self) -> dict[ActionLabel, int]:
         with self.waiting_for_file.open("r") as f:
             for line in f.readlines():
                 js = json.loads(line)
-                label = (Path(js["label"][0]), js["label"][1])
+                label = ActionLabel(Path(js["label"][0]), js["label"][1])
                 self._waiting_for[label] = int(js["count"])
 
         return self._waiting_for
@@ -960,7 +963,7 @@ class BasicAction(ActionBase):
 
             logger.debug(f"Joined")
             assert len(list(mountpoint.iterdir())) == 0
-            merge_access_logs((self.directory, self.name))
+            merge_access_logs(self.label)
             with self.last_definition().open("w") as f:
                 first_line = self.action_setup_record
                 schema = class_schema(ActionSetupRecorder)()
@@ -1034,7 +1037,7 @@ class BasicAction(ActionBase):
                 + self.name
             ).exists():
                 logger.debug(f"({self.directory}, {self.name}) in invocation dir")
-                dependencies_ok[(self.directory, self.name)] = True
+                dependencies_ok[ActionLabel(self.directory, self.name)] = True
                 return Ok(False)
 
         count = 0
@@ -1188,7 +1191,7 @@ class LoadBuildFileAction(BasicAction):
         self.buildfile = buildfile
         BasicAction.__init__(
             self,
-            (buildfile.parent, "FUSEBUILD.py"),
+            ActionLabel(buildfile.parent, "FUSEBUILD.py"),
             Action(cmd, category="", tmp=RandomTmpDir()),
         )
 
@@ -1213,7 +1216,7 @@ class RuleAction(BasicAction):
 def clean_nonexisting_action(path: Path, name: str):
     logger.info(f"Clean non-exsisting target {path}/{name}")
     empty_action = Action(cmd=[], category="internal_clean")
-    action = RuleAction((path, name), empty_action)
+    action = RuleAction(ActionLabel(path, name), empty_action)
     action.require_for_build()
     action.clean()
     action.status = StatusEnum.DELETED
@@ -1221,10 +1224,10 @@ def clean_nonexisting_action(path: Path, name: str):
 
 
 visited_directories: set[Path] = set([])
-loaded_actions: dict[tuple[Path, str], Action] = {}
+loaded_actions: dict[ActionLabel, Action] = {}
 
 
-def all_actions() -> Iterable[tuple[Path, str]]:
+def all_actions() -> Iterable[ActionLabel]:
     return loaded_actions.keys()
 
 
@@ -1238,7 +1241,7 @@ def load_action_file(label: ActionLabel, action_file: Path) -> Action:
         action = action_schema.load(d)
         for provider in action.providers.values():
             provider.output_dir = (
-                Path(output_folder_root_str + str(label[0])) / label[1]
+                Path(output_folder_root_str + str(label.path)) / label.name
             )
 
     logger.debug(f"Got action {action_file}: {action}")
@@ -1253,7 +1256,7 @@ def load_actions(path: Path) -> dict[ActionLabel, Action]:
         "*.json"
     ):
         name = action_file.name.removesuffix(".json")
-        label = (path, name)
+        label = ActionLabel(path, name)
         action = load_action_file(label, action_file)
         loaded_actions[label] = action
         actions[label] = action
@@ -1290,14 +1293,15 @@ def get_action(
     if path.is_file():
         path = path.parent
 
-    if (path, action) in loaded_actions:
-        return loaded_actions[(path, action)]
+    label = ActionLabel(path, action)
+    if label in loaded_actions:
+        return loaded_actions[label]
 
     if path in visited_directories:
         # SBUILD file load and actions are up-to-date, but no such action
         return None
 
-    res = check_build_file(path / "FUSEBUILD.py", invoker, str((path, action)))
+    res = check_build_file(path / "FUSEBUILD.py", invoker, str(label))
     match res:
         case Err(ret):
             logger.warning(f"Failed to load {path / 'FUSEBUILD.py'}: Returned {ret}")
@@ -1305,11 +1309,11 @@ def get_action(
         case Ok(actions):
             pass
 
-    if (path, action) not in loaded_actions:
-        logger.info(f"{path}/{action} not defined {loaded_actions=}")
+    if label not in loaded_actions:
+        logger.info(f"{label} not defined {loaded_actions=}")
         return None
 
-    return loaded_actions[(path, action)]
+    return loaded_actions[label]
 
 
 def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> RuleAction | None:
@@ -1324,7 +1328,7 @@ def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> RuleAction | 
             p = p.absolute()
             if p.is_file():
                 p = p.parent
-            return RuleAction((p, name), action)
+            return RuleAction(ActionLabel(p, name), action)
 
 
 def get_action_from_path(
@@ -1340,7 +1344,7 @@ def get_action_from_path(
             action = get_action(t, name, invoker)
             logger.debug(f"get_action({t}, {name}) returned {action=}")
             if isinstance(action, Action):
-                return ((t, name), action)
+                return (ActionLabel(t, name), action)
             else:
                 return None
 

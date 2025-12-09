@@ -7,7 +7,7 @@ from pathlib import Path
 
 from absl.testing.absltest import TestCase, main  # type: ignore
 
-from fusebuild import output_folder_root
+from fusebuild import ActionLabel, output_folder_root
 
 # Load internal stuff to test internal state
 from fusebuild.core.access_recorder import load_action_deps
@@ -127,10 +127,10 @@ class TestExample1(TestCase):
             ]
         )
         self.assertEqual(ret.returncode, 0)
-        deps = load_action_deps((self.workdir, "access_non_existant_rule"))
+        deps = load_action_deps(ActionLabel(self.workdir, "access_non_existant_rule"))
         logger.info(f"{deps=}")
         self.assertGreaterEqual(len(deps), 1)
-        self.assertTrue((self.workdir, "nonexistant_rule") in deps)
+        self.assertTrue(ActionLabel(self.workdir, "nonexistant_rule") in deps)
 
     def test_failed_action(self):
         self.assertTrue(self.workdir.exists())

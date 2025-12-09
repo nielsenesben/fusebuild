@@ -179,18 +179,18 @@ class AccessRecorder:
     def flush(self):
         with self.action_deps_file.open("w") as f:
             for ad in self.action_deps:
-                f.write(f"{ad[0]}/{ad[1]}\n")
+                f.write(f"{ad}\n")
 
 
 def check_accesses_inner_loop(
     label: ActionLabel,
     check_build_target: Callable[
-        [Path, ActionInvoker], tuple[bool, tuple[Path, str] | None]
+        [Path, ActionInvoker], tuple[bool, ActionLabel | None]
     ],
     invoker: ActionInvoker,
 ) -> bool:
     matches = True
-    central_dir = label[0].absolute()
+    central_dir = label.path.absolute()
     access_log = access_log_file(label)
     with access_log.open("r", encoding="utf-8") as f:
         for line in f:
@@ -287,7 +287,7 @@ def merge_access_logs(label: ActionLabel):
 def check_accesses(
     label: ActionLabel,
     check_build_target: Callable[
-        [Path, ActionInvoker], tuple[bool, tuple[Path, str] | None]
+        [Path, ActionInvoker], tuple[bool, ActionLabel | None]
     ],
     invoker: ActionInvoker,
 ) -> bool:

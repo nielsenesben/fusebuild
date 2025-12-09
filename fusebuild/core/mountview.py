@@ -25,9 +25,9 @@ def main(label: ActionLabel):
     schema = marshmallow_dataclass2.class_schema(Action)()
     action_dir_ = action_dir(label)
     action_file = (
-        Path(str(output_folder_root_str + str(label[0])))
+        Path(str(output_folder_root_str + str(label.path)))
         / "FUSEBUILD.py"
-        / (label[1] + ".json")
+        / (label.name + ".json")
     )
     with action_file.open("r") as f:
         d = json.load(f)
@@ -36,12 +36,12 @@ def main(label: ActionLabel):
     logger.debug(f"{action=}")
     access_log = new_access_log_file(label)
     mountpoint = action_dir_ / "mountpoint"
-    writeable = Path(output_folder_root_str + str(label[0])) / label[1]
+    writeable = Path(output_folder_root_str + str(label.path)) / label.name
     logger.debug(f"Mounting on {mountpoint=} with {writeable=}")
     with access_log.open("w", encoding="utf-8") as access_log_file:
         logger.debug(f"{access_log=}")
         access_recorder = AccessRecorder(
-            central_dir=label[0],
+            central_dir=label.path,
             access_log=access_log_file,
             action_deps_file=action_dir_ / "action_deps.txt",
         )
@@ -72,4 +72,4 @@ def main(label: ActionLabel):
 
 
 if __name__ == "__main__":
-    sys.exit(main((Path(sys.argv[1]), sys.argv[2])))
+    sys.exit(main(ActionLabel(Path(sys.argv[1]), sys.argv[2])))
