@@ -242,7 +242,7 @@ def check_build_target(
     return False, label
 
 
-class BasicMount(Fuse):
+class BasicMount(Fuse):  # type: ignore
     def __init__(
         self,
         label: ActionLabel,
