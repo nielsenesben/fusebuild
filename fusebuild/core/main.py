@@ -26,7 +26,6 @@ from .graph import sort_graph
 from .libfusebuild import (
     FUSEBUILD_INVOCATION_DIR,
     ActionBase,
-    ActionInvoker,
     BasicAction,
     StatusEnum,
     all_actions,

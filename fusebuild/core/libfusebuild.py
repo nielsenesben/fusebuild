@@ -44,7 +44,6 @@ from result import Err, Ok, Result
 
 from fusebuild.core.access_recorder import (
     AccessRecorder,
-    DependencyValue,
     access_log_file,
     action_deps_file,
     check_accesses,
