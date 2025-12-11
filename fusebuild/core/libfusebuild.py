@@ -68,7 +68,7 @@ from fusebuild.core.file_layout import (
     output_folder_root_str,
 )
 
-from .action_invoker import ActionInvoker
+from .action_invoker import ActionInvoker, WaitingFor
 
 # pull in some spaghetti to make this stuff work without fuse-py being installed
 try:
@@ -106,7 +106,7 @@ def check_pid(pid: int) -> bool:
     return psutil.pid_exists(pid)
 
 
-def kill_subprocess(process: subprocess.Popen | psutil.Popen) -> None:
+def kill_subprocess(process: subprocess.Popen[bytes] | psutil.Popen) -> None:
     pid = process.pid
 
     if not check_pid(pid):
@@ -351,7 +351,7 @@ class BasicMount(Fuse):  # type: ignore
             self.access_recorder.record_readlink(path, res)
         return res
 
-    def readdir(self, path_in: Path, offset: int) -> Iterable[os.DirEntry]:
+    def readdir(self, path_in: Path, offset: int) -> Iterable[os.DirEntry[str]]:
         path, is_output = self.common_handle_path(path_in)
         logger.debug(f"readdir {path} {offset}")
         to_record = []
@@ -719,9 +719,9 @@ class ActionBase(ActionInvoker):
             d = json.load(f)
             return schema.load(d)
 
-    def waiting_for(self, label: ActionLabel) -> AbstractContextManager:
-        class WaitingFor:
-            def __enter__(this) -> "WaitingFor":
+    def waiting_for(self, label: ActionLabel) -> AbstractContextManager[WaitingFor]:
+        class WaitingForImpl(WaitingFor):
+            def __enter__(this) -> WaitingFor:
                 with self.get_status_lock_file():
                     self._read_waiting_for()
                     if label in self._waiting_for:
@@ -747,7 +747,7 @@ class ActionBase(ActionInvoker):
                         self._waiting_for.pop(label)
                     self._write_waiting_for()
 
-        return WaitingFor()
+        return WaitingForImpl()
 
 
 class BasicAction(ActionBase):
