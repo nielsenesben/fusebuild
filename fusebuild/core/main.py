@@ -3,6 +3,7 @@ import logging
 logging.basicConfig(format="%(process)d %(filename)s %(lineno)d: %(message)s")
 
 import argparse
+import asyncio
 import inspect
 import os
 import signal
@@ -10,9 +11,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
+from enum import Enum
+from multiprocessing import cpu_count
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Callable, Iterable, Protocol
 
 import filelock
 import psutil
@@ -20,7 +24,7 @@ from result import Err, Ok
 
 from .access_recorder import load_action_deps
 from .action import Action, ActionLabel, label_from_line
-from .action_invoker import DummyInvoker
+from .action_invoker import ActionInvoker, DummyInvoker
 from .file_layout import action_dir
 from .graph import sort_graph
 from .libfusebuild import (
@@ -31,9 +35,10 @@ from .libfusebuild import (
     all_actions,
     check_build_file,
     find_all_actions,
-    get_action_from_path,
+    get_action,
     get_rule_action,
-    run_action,
+    load_actions,
+    run_action_cmd_env,
 )
 from .logger import FUSEBUILD_LOG_LEVEL, getLogger
 
@@ -69,7 +74,10 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
     try:
         with action.get_status_lock_file().acquire(blocking=False):
             status = action._read_status()
-            assert status is not None  # Must have run now, so status can't be None
+            if status is None:
+                # Must have run now, but on failures
+                print(f"{label} isn't defined")
+                return
             if status.status != StatusEnum.DONE:
                 print(
                     f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed"
@@ -96,9 +104,188 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
         print_output(label)
 
 
+class BuildActionStatus(Enum):
+    IN_QUEUE = 0
+    RUNNING = 1
+    SUCCESSFULL = 2
+    FAILED = 3
+
+
+@dataclass
+class BuildAction:
+    label: ActionLabel
+    needed: bool
+    status: BuildActionStatus = BuildActionStatus.IN_QUEUE
+    deps: set[ActionLabel] = field(default_factory=set)
+    done_actions: set[Callable[[], None]] = field(default_factory=set)
+
+
+class ActionExecuter(Protocol):
+    def schedule_action(self, action: BuildAction) -> None:
+        """Execute action if it matches category"""
+        ...
+
+
+class ActionExecuterImpl(ActionExecuter):
+    actions: dict[ActionLabel, BuildAction]
+    running: dict[asyncio.Task[Any], tuple[asyncio.subprocess.Process, BuildAction]]
+    waiting: list[BuildAction]
+    need_resort: bool
+    failures: list[BuildAction]
+    max_running: int
+    invoker: ActionInvoker
+
+    def __init__(self, max_running: int) -> None:
+        self.actions = {}
+        self.running = {}
+        self.waiting = []
+        self.need_resort = False
+        self.failures = []
+        self.max_running = max_running
+        self.invoker = DummyInvoker()
+
+    def schedule_action(self, action: BuildAction) -> None:
+        self.need_resort = True
+        logger.debug(f"Scheduling {action.label}")
+        if action.label in self.actions:
+            old_action = self.actions[action.label]
+            old_action.deps.update(action.deps)
+            old_action.done_actions.update(action.done_actions)
+            old_action.needed = old_action.needed or action.needed
+        else:
+            self.actions[action.label] = action
+            self.waiting.append(action)
+            for d in load_action_deps(action.label):
+                logger.debug(f"Adding dependency {d} for {action.label}")
+                action.deps.add(d)
+                if d not in self.actions:
+                    self.schedule_action(BuildAction(d, needed=False))
+            if action.label.name != "FUSEBUILD.py":
+                bf_label = ActionLabel(action.label.path, "FUSEBUILD.py")
+                logger.debug(f"Adding {bf_label} for {action.label}")
+
+                action.deps.add(bf_label)
+                if bf_label not in self.actions:
+                    self.schedule_action(BuildAction(bf_label, needed=True))
+
+    def sort_waiting(self) -> None:
+        graph: dict[ActionLabel, list[ActionLabel]] = {}
+
+        def members() -> Iterable[BuildAction]:
+            for a in self.waiting:
+                assert a.status == BuildActionStatus.IN_QUEUE
+                yield a
+            for ta in self.running.values():
+                assert ta[1].status == BuildActionStatus.RUNNING
+                yield ta[1]
+
+        for a in members():
+            graph[a.label] = [
+                d
+                for d in a.deps
+                if self.actions[d].status
+                in [BuildActionStatus.IN_QUEUE, BuildActionStatus.RUNNING]
+            ]
+        assert len(graph) == len(self.waiting) + len(self.running)
+        sorted_actions = sort_graph(graph)
+        assert len(sorted_actions) == len(graph)
+        waiting_new = [
+            self.actions[al]
+            for al in sorted_actions
+            if self.actions[al].status == BuildActionStatus.IN_QUEUE
+        ]
+        waiting_new_labels = set([a.label for a in waiting_new])
+        waiting_old_labels = set([a.label for a in self.waiting])
+        if waiting_new_labels != waiting_old_labels:
+            logger.error(
+                f"Missing in new labels: {waiting_old_labels - waiting_new_labels}"
+            )
+            logger.error(
+                f"New in new labels: {waiting_new_labels - waiting_old_labels}"
+            )
+            assert False
+        self.waiting = waiting_new
+
+    async def start_running(self, action: BuildAction) -> None:
+        logger.debug(f"Starting {action.label}")
+        print(f"{action.label}..")
+        assert action.status == BuildActionStatus.IN_QUEUE
+        action.status = BuildActionStatus.RUNNING
+        cmd, env = run_action_cmd_env(
+            action.label.path, action.label.name, self.invoker
+        )
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
+        logger.debug(f"Running {cmd} with env {env} in {proc.pid=}")
+        task = asyncio.create_task(proc.wait())
+        self.running[task] = (proc, action)
+        action.status = BuildActionStatus.RUNNING
+
+    def action_done(self, task: asyncio.Task[Any]) -> None:
+        assert task in self.running
+        process, action = self.running.pop(task)
+        logger.debug(f"{action.label}: {process.returncode}")
+        if process.returncode == 0:
+            action.status = BuildActionStatus.SUCCESSFULL
+            print(f"{action.label} ... Ok")
+            for done_cb in action.done_actions:
+                done_cb()
+        else:
+            print(f"{action.label} ... Failed")
+            action.status = BuildActionStatus.FAILED
+            if action.needed:
+                self.failures.append(action)
+
+    async def run(self) -> int:
+        while True:
+            if len(self.failures) > 0:
+                failure = self.failures[0]
+                print_failure(failure.label, set([]))
+                return 1
+
+            pre_sort = len(self.waiting)
+            if self.need_resort:
+                self.sort_waiting()
+            assert pre_sort == len(self.waiting)
+
+            while len(self.waiting) > 0 and len(self.running) < self.max_running:
+                await self.start_running(self.waiting[0])
+                self.waiting = self.waiting[1:]
+
+            if len(self.running) == 0 and len(self.waiting) == 0:
+                return 0
+
+            logger.debug(f"Waiting for one of {len(self.running)} actions.")
+            done, pending = await asyncio.wait(
+                [t for t in self.running.keys()],
+                timeout=10,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if len(done) == 0:
+                logger.debug("timeout")
+                continue
+
+            for d in done:
+                self.action_done(d)
+
+
+@dataclass(frozen=True)
+class ScheduleAll:
+    executer: ActionExecuter
+    bf_label: ActionLabel
+    categories: frozenset[str]
+
+    def __call__(self) -> None:
+        actions = load_actions(self.bf_label.path)
+        print(f"Loading all actions {self.bf_label}")
+        for label, action in actions.items():
+            if action.category in self.categories:
+                self.executer.schedule_action(BuildAction(label, needed=True))
+
+
 def main_inner(args: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--verbose", action="count", default=0)
+    parser.add_argument("-v", "--verbose", action="count", default=0)
+    parser.add_argument("-j", "--parallel", type=int, default=0)
     parser.add_argument("category", type=str)
     parser.add_argument("target", nargs="+", type=Path)
     arg = parser.parse_args(args=args)
@@ -112,10 +299,15 @@ def main_inner(args: list[str]) -> int:
         logger.info(f"{logger.name} {log_level=}")
     logger.info(f"{arg.verbose=} {logging.getLevelName(log_level)}")
 
-    categories = arg.category.split(",")
+    logger.info(f"Using {os.environ[FUSEBUILD_INVOCATION_DIR]} as invocation dir.")
+
+    categories = frozenset(arg.category.split(","))
 
     invoker = DummyInvoker()
-    targets: dict[ActionLabel, Action] = {}
+    max_running = arg.parallel
+    if max_running <= 0:
+        max_running = cpu_count()
+    executer = ActionExecuterImpl(max_running=max_running)
     for ti in arg.target:
         t: Path = ti.absolute()
         logger.debug(f"Processing {ti} at {os.getcwd()=}: {t=}")
@@ -123,76 +315,32 @@ def main_inner(args: list[str]) -> int:
             if not t.is_dir():
                 print(f"{t} is an file, not an action", file=sys.stderr)
                 sys.exit(1)
-            ret = find_all_actions(t, invoker)
-            match ret:
-                case Err(failed):
-                    print(f"Failed to load {failed}.", file=sys.stderr)
-                    sys.exit(1)
-                case Ok(actions):
-                    targets.update(actions)
-        else:
-            label_action = get_action_from_path(t, invoker)
-            if label_action is None:
-                print(f"Can't find action for {t}", file=sys.stderr)
-                return 1
-            targets[label_action[0]] = label_action[1]
-
-    graph: dict[ActionLabel, list[ActionLabel]] = {}
-
-    def helper(l: ActionLabel) -> None:
-        deps = load_action_deps(l)
-        graph[l] = deps
-        logger.debug(f"Graph {l}: {deps}")
-        for d in deps:
-            if d not in graph:
-                helper(d)
-
-    for label, action in targets.items():
-        if action.category in categories:
-            if label not in graph:
-                helper(label)
-
-    logger.debug(f"{graph=}")
-    sorted_actions = sort_graph(graph)
-    logger.info(f"{sorted_actions=}")
-    for label in sorted_actions:
-        rule_action = get_rule_action(label.path, label.name, invoker)
-        if rule_action is None:
-            if label in targets:
-                print(f"Can't find action for {label}", file=sys.stderr)
-                return 1
-            else:
-                # Just ignore it, everything might work anyway
-                logger.info(f"Old dependency to now missing action {label}")
-                continue
-
-        print(f"{label}....", end="")
-        needs_rebuild_result = rule_action.needs_rebuild("from main loop")
-        rule_action.release_lock()
-        match needs_rebuild_result:
-            case Err(b):
-                logger.warning(
-                    f"Got error when calling need_rebuild on {rule_action.label}"
+            build_files = t.glob("**/FUSEBUILD.py")
+            for bf in build_files:
+                bf_label = ActionLabel(bf.parent, bf.name)
+                action = BuildAction(
+                    bf_label,
+                    needed=True,
+                    done_actions={ScheduleAll(executer, bf_label, categories)},
                 )
-                sys.exit(1)
-            case Ok(needs_rebuild):
-                if not needs_rebuild:
-                    print(".. Unchanged")
-                    continue
-            case _:
-                assert False
+                executer.schedule_action(action)
 
-        res = run_action(label.path, label.name, invoker)
-        if res != 0:
-            print(".. failed")
-            if label in targets:
-                print_failure(label, set([]))
-                return 1
-            # otherwise just continue - the _targets_ _might_ be ok
         else:
-            print("..Ok")
-
-    return 0
+            while True:
+                name = t.name
+                t_next = t.parent
+                if t_next == t:
+                    print(f"Can't find build file matching {ti}", file=sys.stderr)
+                    return 1
+                t = t_next
+                logger.debug(f"{t=} {name=}")
+                build_file = t / "FUSEBUILD.py"
+                if build_file.exists():
+                    executer.schedule_action(
+                        BuildAction(ActionLabel(t, name), needed=True)
+                    )
+                    break
+    return asyncio.run(executer.run())
 
 
 def kill_process(process: psutil.Process, signal: int, tmp_dir: str) -> None:
@@ -261,6 +409,7 @@ def main(args: list[str]) -> int:
         signal.signal(signal.SIGINT, handler)
         try:
             ret = main_inner(args)
+            logger.info(f"Result of main: {ret}")
             return ret
         finally:
             signal_handler(tmp_dir, signal.SIGHUP)
