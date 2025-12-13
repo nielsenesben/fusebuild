@@ -2,8 +2,12 @@ from pathlib import Path
 from test.test_providers.providers import TestProvider
 
 from fusebuild import get_action, shell_action
+from fusebuild.python import mypy_actions
 
 print(f"Loading {__file__}")
+
+mypy_actions()
+
 
 shell_action(
     name="hasprovider",

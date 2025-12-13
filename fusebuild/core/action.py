@@ -1,4 +1,6 @@
+import json
 import re
+import typing
 from copy import deepcopy
 from dataclasses import dataclass, field
 from importlib import import_module
@@ -88,7 +90,7 @@ class BwrapSandbox(Sandbox):
         return total_cmd, environ
 
 
-def fullname(o):
+def fullname(o: Any) -> str:
     klass = o.__class__
     module = klass.__module__
     if module == "builtins":
@@ -96,19 +98,27 @@ def fullname(o):
     return module + "." + klass.__qualname__
 
 
-def get_definition(name: str):
+def get_definition(name: str) -> Any:
     parts = name.rsplit(".", 1)
     return getattr(import_module(parts[0]), parts[1])
 
 
 class ProtocolField(fields.Field):
-    def _serialize(self, value, attr, obj, **kwargs) -> dict[str, Any] | None:
+    def _serialize(
+        self, value: Any, attr: str | None, obj: Any, **kwargs: Any
+    ) -> dict[str, Any] | None:
         if value is None:
             return None
         schema = marshmallow_dataclass2.class_schema(value.__class__)()
         return {"type": fullname(value), "value": schema.dump(value)}
 
-    def _deserialize(self, value, attr, data, **kwargs):
+    def _deserialize(
+        self,
+        value: Any,
+        attr: str | None,
+        data: typing.Mapping[str, Any] | None,
+        **kwargs: Any,
+    ) -> Any:
         if value is None:
             return None
 
@@ -129,7 +139,9 @@ class ProtocolField(fields.Field):
 
 
 class ProtocolList(fields.Field):
-    def _serialize(self, value, attr, obj, **kwargs) -> list[dict[str, Any]] | None:
+    def _serialize(
+        self, value: Any, attr: str | None, obj: Any, **kwargs: None
+    ) -> list[dict[str, Any]] | None:
         if value is None:
             return None
         ret = []
@@ -139,7 +151,13 @@ class ProtocolList(fields.Field):
 
         return ret
 
-    def _deserialize(self, value, attr, data, **kwargs):
+    def _deserialize(
+        self,
+        value: Any,
+        attr: str | None,
+        data: typing.Mapping[str, Any] | None,
+        **kwargs: Any,
+    ) -> Any:
         if value is None:
             return None
 
@@ -207,14 +225,14 @@ class PatternRemapToOutput(MappingDefinition):
         return PatternRemapOutput(self.regexp, str(output_folder) + self.output)
 
 
-@dataclass
 class Provider:
-    # output_dir: str = field(metadata={"marshmallow": {"dump_by": lambda x: None}})
-    pass
+    output_dir: Path = field(metadata={"marshmallow": {"dump_by": lambda x: None}})
 
 
 class ProtocolDict(fields.Field):
-    def _serialize(self, value, attr, obj, **kwargs) -> dict[str, Any] | None:
+    def _serialize(
+        self, value: Any, attr: str | None, obj: Any, **kwargs: Any
+    ) -> dict[str, Any] | None:
         if value is None:
             return None
         ret = {}
@@ -224,7 +242,9 @@ class ProtocolDict(fields.Field):
 
         return ret
 
-    def _deserialize(self, value, attr, data, **kwargs):
+    def _deserialize(
+        self, value: Any, attr: str | None, data: Any, **kwargs: Any
+    ) -> Any:
         if value is None:
             return {}
 
@@ -272,7 +292,7 @@ class ActionStatus:
     rerun: bool
 
 
-def label_from_line(line: str):
+def label_from_line(line: str) -> ActionLabel:
     """Assumes action names doesn't contain / - might change"""
     last_slash = line.rfind("/")
     return ActionLabel(Path(line[0:last_slash]), line[last_slash + 1 :].rstrip())

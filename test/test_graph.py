@@ -1,11 +1,11 @@
-from absl.testing.absltest import TestCase, main  # type: ignore
+from absl.testing.absltest import TestCase, main
 
 from fusebuild.core.graph import sort_graph
 
 
 class TestExample1(TestCase):
-    def test_sort_graph(self):
-        graph = {}
+    def test_sort_graph(self) -> None:
+        graph: dict[int, list[int]] = {}
         graph[0] = []
         graph[1] = [0]
         graph[2] = [1]
@@ -23,7 +23,7 @@ class TestExample1(TestCase):
         )
         self.assertTrue(sorted.index(3) < sorted.index(4), "4 depends on 3")
 
-    def test_sort_graph_cyclic(self):
+    def test_sort_graph_cyclic(self) -> None:
         graph = {}
         graph[0] = [4]
         graph[1] = [0]

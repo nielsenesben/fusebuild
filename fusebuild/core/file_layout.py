@@ -19,15 +19,15 @@ action_folder_root = fusebuild_folder / "actions"
 action_folder_root_str = str(action_folder_root)
 
 
-def action_dir(label: ActionLabel):
+def action_dir(label: ActionLabel) -> Path:
     return Path(action_folder_root_str + str(label.path)) / label.name
 
 
-def output_dir(label: ActionLabel):
+def output_dir(label: ActionLabel) -> Path:
     return Path(output_folder_root_str + str(label.path)) / label.name
 
 
-def is_rule_output(path: str) -> bool:
+def is_rule_output(path: str | Path) -> bool:
     res = os.path.commonprefix([output_folder_root_str, path]) == output_folder_root_str
     logger.debug(f"is_rule_output {path}: {res}")
     return res

@@ -1,9 +1,11 @@
-from fusebuild.core.action import (
-    BwrapSandbox,
-    NoSandbox,
-    PatternRemapToOutput,
-    Provider,
-)
-from fusebuild.core.actions import ActionLabel, action, get_action, shell_action
-from fusebuild.core.file_layout import output_folder_root
-from fusebuild.core.helpers import top_output_dir, topdir
+from fusebuild.core.action import ActionLabel as ActionLabel
+from fusebuild.core.action import BwrapSandbox as BwrapSandbox
+from fusebuild.core.action import NoSandbox as NoSandbox
+from fusebuild.core.action import PatternRemapToOutput as PatternRemapToOutput
+from fusebuild.core.action import Provider as Provider
+from fusebuild.core.actions import action as action
+from fusebuild.core.actions import get_action as get_action
+from fusebuild.core.actions import shell_action as shell_action
+from fusebuild.core.file_layout import output_folder_root as output_folder_root
+from fusebuild.core.helpers import top_output_dir as top_output_dir
+from fusebuild.core.helpers import topdir as topdir

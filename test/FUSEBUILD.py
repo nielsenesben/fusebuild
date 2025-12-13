@@ -1,8 +1,8 @@
 from fusebuild import BwrapSandbox, NoSandbox, get_action, shell_action
-from fusebuild.python import pyc_actions, pyc_mappings
+from fusebuild.python import mypy_actions, pyc_actions, pyc_mappings
 
 pyc_actions()
-
+mypy_actions()
 shell_action(
     name="run_test_example1_nosandbox",
     cmd="\n".join(

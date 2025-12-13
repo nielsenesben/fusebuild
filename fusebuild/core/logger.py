@@ -7,7 +7,7 @@ logging.basicConfig(format="%(process)d %(filename)s %(lineno)d: %(message)s")
 FUSEBUILD_LOG_LEVEL = "FUSEBUILD_LOG_LEVEL"
 
 
-def getLogger(name: str):
+def getLogger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
 
     if FUSEBUILD_LOG_LEVEL in os.environ:

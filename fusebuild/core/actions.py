@@ -2,10 +2,11 @@
 import inspect
 import json
 from pathlib import Path
+from typing import Any
 
 import marshmallow_dataclass2
 
-from .action import Action, ActionLabel, BwrapSandbox, TmpDir, TmpStrategy
+from .action import Action, ActionLabel, BwrapSandbox, Provider, TmpDir, TmpStrategy
 from .file_layout import output_dir, output_folder_root_str
 from .libfusebuild import load_action_file, loaded_actions
 from .logger import getLogger
@@ -13,14 +14,14 @@ from .logger import getLogger
 logger = getLogger(__name__)
 
 
-def _action(name: str, cmd: list[str], **kwargs) -> Action:
+def _action(name: str, cmd: list[str], **kwargs: Any) -> Action:
     frame = inspect.currentframe()
 
     while True:
         assert frame is not None
-        p = Path(frame.f_code.co_filename)
-        if p.name == "FUSEBUILD.py":
-            directory = p.parent
+        path = Path(frame.f_code.co_filename)
+        if path.name == "FUSEBUILD.py":
+            directory = path.parent
             break
         else:
             frame = frame.f_back
@@ -42,9 +43,9 @@ def _action(name: str, cmd: list[str], **kwargs) -> Action:
     else:
         mappings = []
 
-    providers = kwargs.get("providers", {})
+    providers: dict[str, Provider] = kwargs.get("providers", {})
     for k, p in providers.items():
-        p.output_dir = output_dir(label)  # type: ignore
+        p.output_dir = output_dir(label)
     category = kwargs.get("category", "build")
 
     action = Action(
@@ -59,15 +60,15 @@ def _action(name: str, cmd: list[str], **kwargs) -> Action:
     return action
 
 
-def action(name: str, cmd: list[str], **kwargs) -> Action:
+def action(name: str, cmd: list[str], **kwargs: Any) -> Action:
     return _action(name, cmd, **kwargs)
 
 
-def shell_action(name: str, cmd: str, **kwargs) -> Action:
+def shell_action(name: str, cmd: str, **kwargs: Any) -> Action:
     return _action(name=name, cmd=["bash", "-e", "-c", cmd], **kwargs)
 
 
-def write_actions():
+def write_actions() -> Any:
     schema = marshmallow_dataclass2.class_schema(Action)()
     for label, action in loaded_actions.items():
         action_path = Path(

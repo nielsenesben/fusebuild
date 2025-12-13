@@ -1,13 +1,13 @@
 import json
 
 import marshmallow_dataclass2
-from absl.testing.absltest import TestCase, main  # type: ignore
+from absl.testing.absltest import TestCase, main
 
 from fusebuild.core.action import Action, PatternRemapToOutput
 
 
 class TestExample1(TestCase):
-    def test_serialize_no_mappings(self):
+    def test_serialize_no_mappings(self) -> None:
         action = Action(cmd=["true"], category="test")
         schema = marshmallow_dataclass2.class_schema(Action)()
         serialized = json.dumps(schema.dump(action))
@@ -15,7 +15,7 @@ class TestExample1(TestCase):
         action_back = schema.load(d)
         self.assertEqual(action_back, action)
 
-    def test_serialize_one_mapping(self):
+    def test_serialize_one_mapping(self) -> None:
         action = Action(
             cmd=["true"],
             category="test",
