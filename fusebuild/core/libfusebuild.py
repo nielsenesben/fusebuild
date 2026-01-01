@@ -197,7 +197,7 @@ def check_build_target(
         if src_dir == Path("/"):
             return True, None
 
-    label = ActionLabel(src_dir, target)
+    label = ActionLabel(src_dir.resolve(), target)
 
     if label in dependencies_ok:
         logger.debug(f"{label} was in dependencies_ok")
@@ -1294,7 +1294,8 @@ def get_action(
     logger.debug(f"get_action({path}, {action})")
     if isinstance(path, str):
         path = Path(path)
-    path = path.absolute()
+
+    path = path.resolve()
     if path.is_file():
         path = path.parent
 
@@ -1330,7 +1331,7 @@ def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> RuleAction | 
         case int(res):
             return None
         case _:
-            p = p.absolute()
+            p = p.resolve()
             if p.is_file():
                 p = p.parent
             return RuleAction(ActionLabel(p, name), action)

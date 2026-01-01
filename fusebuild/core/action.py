@@ -186,6 +186,10 @@ class ActionLabel:
     path: Path
     name: str
 
+    def __post_init__(self) -> None:
+        assert self.path.is_absolute()
+        assert self.path.resolve() == self.path
+
     def __str__(self) -> str:
         return f"{str(self.path)}/{self.name}"
 
