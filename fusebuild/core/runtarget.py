@@ -8,7 +8,7 @@ from pathlib import Path
 from fusebuild.core.action import ActionLabel
 from fusebuild.core.action_invoker import ActionInvoker, DummyInvoker
 from fusebuild.core.libfusebuild import ActionBase, Status, get_rule_action
-from fusebuild.core.logger import getLogger
+from fusebuild.core.logger import getLogger, setLoggerPrefix
 
 logger = getLogger(__name__)
 # logging.basicConfig(level=logging.DEBUG)
@@ -16,9 +16,8 @@ logger = getLogger(__name__)
 
 def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | None:
     # os.setpgrp()
-    logger.debug(f"Runtarget {buildfile=} {target=}")
+    logger.debug(f"Runtarget {buildfile=} {target=} {invoker=}")
     assert buildfile.is_file()
-    label = (buildfile.parent, target)
     action = get_rule_action(buildfile.parent, target, invoker)
     if action is None:
         return -1
@@ -34,4 +33,7 @@ if __name__ == "__main__":
         invoker = ActionBase(ActionLabel(Path(sys.argv[3]), sys.argv[4]))
     else:
         invoker = DummyInvoker()
-    sys.exit(_runtarget(Path(sys.argv[1]), sys.argv[2], invoker))
+    setLoggerPrefix(f"runtarget {sys.argv[2]}")
+    result = _runtarget(Path(sys.argv[1]), sys.argv[2], invoker)
+    logger.debug(f"Result of {sys.argv}: {result}")
+    sys.exit(result)
