@@ -8,7 +8,7 @@ from .access_recorder import AccessRecorder, new_access_log_file
 from .action import Action, ActionLabel
 from .file_layout import action_dir, action_folder_root_str, output_folder_root_str
 from .libfusebuild import ActionBase, BasicMount, check_build_target
-from .logger import getLogger
+from .logger import getLogger, setLoggerPrefix
 
 logger = getLogger(__name__)
 
@@ -73,4 +73,6 @@ def main(label: ActionLabel) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(ActionLabel(Path(sys.argv[1]), sys.argv[2])))
+    label = ActionLabel(Path(sys.argv[1]), sys.argv[2])
+    setLoggerPrefix(f"mountview {sys.argv[2]}")
+    sys.exit(main(label))
