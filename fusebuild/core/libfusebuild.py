@@ -154,20 +154,23 @@ def flag2mode(flags: int) -> str:
     return m
 
 
+def run_action_cmd_env(
+    directory: Path, target: str, invoker: ActionInvoker
+) -> tuple[list[str], Any]:
+    return [
+        "python3",
+        str(Path(__file__).parent / "runtarget.py"),
+        str(directory.absolute() / "FUSEBUILD.py"),
+        target,
+    ] + invoker.runtarget_args(), os.environ
+
+
 def run_action(directory: Path, target: str, invoker: ActionInvoker) -> int:
     logger.debug(f"Run action {directory} / {target}")
     process = None
     try:
-        process = psutil.Popen(
-            [
-                "python3",
-                str(Path(__file__).parent / "runtarget.py"),
-                str(directory.absolute() / "FUSEBUILD.py"),
-                target,
-            ]
-            + invoker.runtarget_args(),
-            env=os.environ,
-        )
+        cmd, env = run_action_cmd_env(directory, target, invoker)
+        process = psutil.Popen(cmd, env=env)
         res = process.wait()
     except:
         logger.error(f"Something went wrong when invoking {directory} / {target}")
@@ -191,8 +194,8 @@ def check_build_target(
         target = src_dir.name
         src_dir = src_dir.parent
         build_file = src_dir / "FUSEBUILD.py"
-        logger.debug(f"{build_file=}")
         if build_file.exists():
+            logger.debug(f"Found {build_file=}")
             break
         if src_dir == Path("/"):
             return True, None
@@ -772,6 +775,7 @@ class BasicAction(ActionBase):
 
     def clean(self) -> None:
         output = self.output_folder()
+        logger.debug(f"Cleaning {output}")
         if output.exists():
             shutil.rmtree(output)
 
@@ -927,6 +931,7 @@ class BasicAction(ActionBase):
                     unmount(mountpoint)
                     kill_subprocess(self.fuse_mount)
                     assert len(list(mountpoint.iterdir())) == 0
+                    self.fuse_mount = None
                 raise
 
             logger.debug(f"{self.cmd} done: {self.action_setup_record.return_code}")
@@ -944,17 +949,20 @@ class BasicAction(ActionBase):
             return self.action_setup_record.return_code
         finally:
             logger.debug(f"Finally {mountpoint}")
+            count = 0
             while self.fuse_mount is not None:
-                if not unmount(mountpoint):
-                    logger.error(f"Failed to unmount {mountpoint}")
+                count += 1
+                quite = count < 10
+                if os.path.ismount(mountpoint) and not unmount(mountpoint, quite=quite):
+                    lc = logger.debug if quite else logger.error
+                    lc(f"Failed to unmount {mountpoint} {count=}")
                 else:
                     logger.debug(f"Called unmount")
                     assert len(list(mountpoint.iterdir())) == 0
 
                 try:
-                    self.fuse_mount.wait(1.0)
-                    logger.debug("Fuse mount stopped")
-                    fuse_return_code = self.fuse_mount.returncode
+                    fuse_return_code = self.fuse_mount.wait(1.0)
+                    logger.debug(f"Fuse mount stopped: {fuse_return_code}")
                     if fuse_return_code != 0:
                         logger.error(
                             f"Fuse mount didn't return ok: {fuse_return_code=}"
@@ -963,7 +971,11 @@ class BasicAction(ActionBase):
                     self.fuse_mount = None
                 except psutil.TimeoutExpired:
                     logger.debug("Timeput while waiting for fuse mount to stop")
-                    pass
+                    assert self.fuse_mount is not None
+                    if count > 60:
+                        kill_subprocess(self.fuse_mount)
+                except Exception as e:
+                    logger.error(f"Error while waiting for fuse mount to stop: {e}")
 
             logger.debug(f"Joined")
             assert len(list(mountpoint.iterdir())) == 0
@@ -1029,10 +1041,7 @@ class BasicAction(ActionBase):
     def last_definition(self) -> Path:
         return self.storage / "last_definition.json"
 
-    def needs_rebuild(self, reason: str) -> Result[bool, bool]:
-        if self.label in dependencies_ok:
-            logger.debug(f"({self.directory}, {self.name}) in dependencies_ok")
-            return Ok(False)
+    def have_ok_file(self) -> bool:
         if FUSEBUILD_INVOCATION_DIR in os.environ:
             if Path(
                 os.environ[FUSEBUILD_INVOCATION_DIR]
@@ -1041,15 +1050,33 @@ class BasicAction(ActionBase):
                 + "/"
                 + self.name
             ).exists():
-                logger.debug(f"({self.directory}, {self.name}) in invocation dir")
-                dependencies_ok[ActionLabel(self.directory, self.name)] = True
-                return Ok(False)
+                logger.debug(f"({self.label} in invocation dir")
+                dependencies_ok[self.label] = True
+                return True
+
+        return False
+
+    def needs_rebuild(self, reason: str) -> Result[bool, bool]:
+        """Check wether the action needs to be rebuild.
+        In case the target was build ok it returns Ok(False), lock not held
+        In case the target was build, but failed this build invocation, it returns Ok(True), lock is held
+        In case it needs an rebuild (changed or failed last time): Ok(True), lock is held
+        In case of deadlock Err(True), lock is not taken
+        """
+
+        if self.label in dependencies_ok:
+            logger.debug(f"({self.directory}, {self.name}) in dependencies_ok")
+            return Ok(False)
+
+        if self.have_ok_file():
+            return Ok(False)
 
         count = 0
         while True:
             count += 1
             required, status = self.require_for_build()
             if required:
+                logger.info(f"Got lock for {self.label}")
                 break
             if count > 1:
                 logger.warning(
@@ -1065,6 +1092,9 @@ class BasicAction(ActionBase):
                 )
             time.sleep(1.0)
 
+        if self.have_ok_file():
+            self.release_lock()
+            return Ok(False)
         self.status = StatusEnum.CHECKING
         self.write_status()
         merge_access_logs(self.label)
@@ -1110,12 +1140,15 @@ class BasicAction(ActionBase):
 
     def run_if_needed(self, invoker: ActionInvoker, reason: str) -> int | None:
         with invoker.waiting_for(self.label) as waiter:
-            match self.needs_rebuild(reason):
-                case Err(b):
+            needs_rebuild = self.needs_rebuild(reason)
+            logger.debug(f"{self.label} needs_rebuild: {needs_rebuild}")
+            match needs_rebuild:
+                case Ok(False):
+                    return 0
+                case Ok(True):
+                    pass
+                case Err(True):
                     return -1
-                case Ok(needs_rebuild):
-                    if not needs_rebuild:
-                        return 0
                 case _:
                     assert False
             if (
@@ -1202,13 +1235,14 @@ class LoadBuildFileAction(BasicAction):
 
     def clean(self) -> None:
         output = self.output_folder()
+        logger.debug(f"Cleaning action.json files from {output}")
         for action_file in output.glob("*.json"):
             action_file.unlink()
 
         schema = marshmallow_dataclass2.class_schema(Action)()
         output.mkdir(exist_ok=True, parents=True)
         action_def = output / (self.buildfile.name + ".json")
-        logger.debug(f"Writing {action_def}")
+        logger.debug(f"Writing {action_def=}")
         with action_def.open("w") as f:
             json.dump(schema.dump(self.action), f)
 
@@ -1255,11 +1289,11 @@ def load_action_file(label: ActionLabel, action_file: Path) -> Action:
 
 def load_actions(path: Path) -> dict[ActionLabel, Action]:
     logger.debug(f"load_actions({path})")
-    logger.debug(f"Looking for actions in {output_folder_root} / {str(path)}")
+    actions_path = (
+        Path(output_folder_root_str + str(path)) / "FUSEBUILD.py"
+    ).absolute()
     actions = {}
-    for action_file in (Path(output_folder_root_str + str(path)) / "FUSEBUILD.py").glob(
-        "*.json"
-    ):
+    for action_file in actions_path.glob("*.json"):
         name = action_file.name.removesuffix(".json")
         label = ActionLabel(path, name)
         action = load_action_file(label, action_file)
@@ -1279,6 +1313,7 @@ def check_build_file(
         return Err(None)
     action = LoadBuildFileAction(buildfile)
     ret = action.run_if_needed(invoker, reason)
+    logger.debug(f"run_if_needed for {buildfile}: {ret}")
     if ret is not None:
         action.release_lock()
     logger.debug(f"LoadBuildFileAction({buildfile}) {ret=}")
@@ -1298,6 +1333,9 @@ def get_action(
     path = path.resolve()
     if path.is_file():
         path = path.parent
+
+    if action == "FUSEBUILD.py":
+        return LoadBuildFileAction(path / "FUSEBUILD.py").action
 
     label = ActionLabel(path, action)
     if label in loaded_actions:
@@ -1322,7 +1360,10 @@ def get_action(
     return loaded_actions[label]
 
 
-def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> RuleAction | None:
+def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> BasicAction | None:
+    if name == "FUSEBUILD.py":
+        return LoadBuildFileAction(p / name)
+
     action = get_action(p, name, invoker)
     logger.debug(f"get_rule_action({p}, {name}) = {action}")
     match action:

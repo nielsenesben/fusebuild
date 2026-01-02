@@ -1,7 +1,9 @@
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+from inspect import getframeinfo, stack
 from pathlib import Path
 
 from absl.testing.absltest import TestCase, main
@@ -10,6 +12,16 @@ from fusebuild import output_folder_root
 from fusebuild.core.logger import getLogger
 
 logger = getLogger(__name__)
+verboses = 0
+logger.setLevel(logging.ERROR - 10 * verboses)
+verbose = ["-v"] * verboses
+
+
+def run(cmd: list[str]) -> int:
+    caller = getframeinfo(stack()[1][0])
+    p = subprocess.Popen(cmd)
+    logger.info(f"{caller.filename}:{caller.lineno} {p.pid=}")
+    return p.wait()
 
 
 class TestExample2(TestCase):
@@ -32,21 +44,26 @@ class TestExample2(TestCase):
             / "output2.txt"
         )
 
-        build_cmd = [
-            "python3",
-            "-m",
-            "fusebuild",
-            "build",
-            str(self.workdir) + "/subdir/dependoneup",
-        ]
+        build_cmd = (
+            [
+                "python3",
+                "-m",
+                "fusebuild",
+            ]
+            + verbose
+            + [
+                "build",
+                str(self.workdir) + "/subdir/dependoneup",
+            ]
+        )
 
-        ret = subprocess.run(build_cmd)
-        self.assertEqual(ret.returncode, 0)
+        ret = run(build_cmd)
+        self.assertEqual(ret, 0)
         self.assertEqual(output_file.read_text(), "something\n")
         old_stat = os.stat(output_file)
 
-        ret = subprocess.run(build_cmd)
-        self.assertEqual(ret.returncode, 0)
+        ret = run(build_cmd)
+        self.assertEqual(ret, 0)
         new_stat = os.stat(output_file)
         self.assertEqual(new_stat, old_stat)  # Not remade when no changes
 
@@ -60,13 +77,13 @@ shell_action(name="someaction",
 """
             )
 
-        ret = subprocess.run(build_cmd)
-        self.assertEqual(ret.returncode, 0)
+        ret = run(build_cmd)
+        self.assertEqual(ret, 0)
         self.assertEqual(output_file.read_text(), "newtext\n")
         old_stat = os.stat(output_file)
 
-        ret = subprocess.run(build_cmd)
-        self.assertEqual(ret.returncode, 0)
+        ret = run(build_cmd)
+        self.assertEqual(ret, 0)
         new_stat = os.stat(output_file)
         self.assertEqual(new_stat, old_stat)
 
@@ -80,16 +97,21 @@ shell_action(name="someaction",
 """
             )
 
-        build_cmd = [
-            "python3",
-            "-m",
-            "fusebuild",
-            "build",
-            str(self.workdir) + "/subdir/dependoneup",
-        ]
+        build_cmd = (
+            [
+                "python3",
+                "-m",
+                "fusebuild",
+            ]
+            + verbose
+            + [
+                "build",
+                str(self.workdir) + "/subdir/dependoneup",
+            ]
+        )
 
-        ret = subprocess.run(build_cmd)
-        self.assertEqual(ret.returncode, 1)
+        ret = run(build_cmd)
+        self.assertEqual(ret, 1)
 
         # Test that failed FUSEBUILD.py gives a failed build
         with (self.workdir / "FUSEBUILD.py").open("w") as f:
@@ -102,16 +124,21 @@ shell_action(name="someaction",
 """
             )
 
-        build_cmd = [
-            "python3",
-            "-m",
-            "fusebuild",
-            "build",
-            str(self.workdir) + "/subdir/dependoneup",
-        ]
+        build_cmd = (
+            [
+                "python3",
+                "-m",
+                "fusebuild",
+            ]
+            + verbose
+            + [
+                "build",
+                str(self.workdir) + "/subdir/dependoneup",
+            ]
+        )
 
-        ret = subprocess.run(build_cmd)
-        self.assertEqual(ret.returncode, 1)
+        ret = run(build_cmd)
+        self.assertEqual(ret, 1)
 
 
 if __name__ == "__main__":

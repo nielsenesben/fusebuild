@@ -35,4 +35,4 @@ shell_action(
     category="demo",
 )
 
-shell_action(name="fail", cmd="false", category="shallfail", sandbox=NoSandbox())
+shell_action(name="fail", cmd="env; false", category="shallfail", sandbox=NoSandbox())
