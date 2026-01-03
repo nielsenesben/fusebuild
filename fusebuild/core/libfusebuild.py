@@ -881,31 +881,25 @@ class BasicAction(ActionBase):
                         subbuild_failed_file = (
                             action_dir(self.label) / "subbuild_failed"
                         )
+                        return_code = None
                         while True:
                             logger.debug(
-                                f"Waiting for cmd for {self.label} to finish {self.build_process.pid=}"
+                                f"Waiting for cmd for {self.label} to finish {self.build_process.pid if self.build_process is not None else None}"
                             )
-                            procs = [
-                                self.build_process,
-                                self.fuse_mount,
-                            ]
-                            gone, alive = psutil.wait_procs(procs, timeout=1.0)
-                            if self.build_process in gone:
+                            try:
+                                assert self.build_process is not None
                                 self.action_setup_record.return_code = (
-                                    self.build_process.returncode
-                                )
-                                logger.info(
-                                    f"Running command for {self.label} finished {self.action_setup_record.return_code=}"
+                                    self.build_process.wait(1.0)
                                 )
                                 self.build_process = None
                                 break
-                            if self.fuse_mount in gone:
-                                logger.error(
-                                    f"Fuse mount exited too early with return code {self.fuse_mount.returncode}"
-                                )
+                            except psutil.TimeoutExpired:
+                                pass
+
+                            if not self.fuse_mount.is_running():
+                                logger.error("Fuse mount exited too early")
+                                assert self.build_process is not None
                                 self.action_setup_record.return_code = -1
-                                self.fuse_mount = None
-                                kill_subprocess(self.build_process)
                                 break
                             subbuild_failed = subbuild_failed_file.exists()
                             if subbuild_failed and self.build_process is not None:
@@ -913,6 +907,7 @@ class BasicAction(ActionBase):
                                     f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}"
                                 )
                                 kill_subprocess(self.build_process)
+                                self.build_process = None
                             if (
                                 subbuild_failed
                                 and self.action_setup_record.return_code is None
@@ -920,7 +915,6 @@ class BasicAction(ActionBase):
                                 logger.info(
                                     f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}, setting return code to -1"
                                 )
-
                                 self.action_setup_record.return_code = -1
             except Exception as e:
                 logger.error(
