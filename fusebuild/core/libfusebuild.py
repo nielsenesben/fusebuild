@@ -24,7 +24,6 @@ import tempfile
 import threading
 import time
 import traceback
-import uuid
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -41,6 +40,8 @@ import marshmallow_dataclass2
 import psutil
 from marshmallow_dataclass2 import class_schema
 from result import Err, Ok, Result
+from watchdog.events import DirModifiedEvent, FileModifiedEvent, FileSystemEventHandler
+from watchdog.observers import Observer
 
 from fusebuild.core.access_recorder import (
     AccessRecorder,
@@ -1072,13 +1073,28 @@ class BasicAction(ActionBase):
             return Ok(False)
 
         count = 0
+        observer: Any = None
+        semaphore = threading.Semaphore()
         while True:
             count += 1
             required, status = self.require_for_build()
             if required:
                 logger.info(f"Got lock for {self.label}")
                 break
-            if count > 1:
+            if observer is None:
+                observer = Observer()
+
+                class StatusChangedEvent(FileSystemEventHandler):
+                    def on_modified(
+                        this, event: DirModifiedEvent | FileModifiedEvent
+                    ) -> None:
+                        semaphore.release()
+
+                observer.schedule(StatusChangedEvent(), self.storage / "status.json")
+                observer.start()
+                continue  # Run immediately again to avoid loosing an event
+
+            if count > 2:
                 logger.warning(
                     f"Couldn't require {self.label} for {reason} for build: {status=} deadlock?"
                 )
@@ -1090,7 +1106,11 @@ class BasicAction(ActionBase):
                 logger.debug(
                     f"Couldn't require {self.label} for build: {status=} {count=}"
                 )
-            time.sleep(1.0)
+
+            semaphore.acquire(timeout=1.0)
+        if observer is not None:
+            observer.stop()
+            observer.join()
 
         if self.have_ok_file():
             self.release_lock()
