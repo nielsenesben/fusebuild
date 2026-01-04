@@ -845,96 +845,65 @@ class BasicAction(ActionBase):
                 pass
 
         logger.debug("Mount complete")
+        logger.debug(f"Start {self.cmd} in {cwd}")
+        env = os.environ.copy()
+        output_dir_full_path = str(self.output_folder().absolute())
+        logger.debug(f"{output_dir_full_path=}")
+        env["OUTPUT_DIR"] = output_dir_full_path
+        match self.action.tmp:
+            case TmpDir(p):
+                env["TMPDIR"] = p
+            case RandomTmpDir():
+                env["TMPDIR"] = tempfile.mkdtemp()
+            case None:
+                if "TMPDIR" in env:
+                    env.pop("TMPDIR")
+            case _:
+                assert False
+
+        spawn_cmd, spawn_env = self.action.sandbox.generate_command(
+            mountpoint, cwd, self.cmd, env
+        )
+
         try:
-            logger.debug(f"Start {self.cmd} in {cwd}")
-            env = os.environ.copy()
-            output_dir_full_path = str(self.output_folder().absolute())
-            logger.debug(f"{output_dir_full_path=}")
-            env["OUTPUT_DIR"] = output_dir_full_path
-            match self.action.tmp:
-                case TmpDir(p):
-                    env["TMPDIR"] = p
-                case RandomTmpDir():
-                    env["TMPDIR"] = tempfile.mkdtemp()
-                case None:
-                    if "TMPDIR" in env:
-                        env.pop("TMPDIR")
-                case _:
-                    assert False
-
-            spawn_cmd, spawn_env = self.action.sandbox.generate_command(
-                mountpoint, cwd, self.cmd, env
-            )
-
-            try:
-                logger.info(f"{spawn_cmd=}  {spawn_env=}")
-                with (self.storage / "stderr").open("wb") as err_file:
-                    with (self.storage / "stdout").open("wb") as out_file:
-                        self.build_process = psutil.Popen(
-                            spawn_cmd, env=spawn_env, stderr=err_file, stdout=out_file
-                        )
+            logger.info(f"{spawn_cmd=}  {spawn_env=}")
+            with (self.storage / "stderr").open("wb") as err_file:
+                with (self.storage / "stdout").open("wb") as out_file:
+                    self.build_process = psutil.Popen(
+                        spawn_cmd, env=spawn_env, stderr=err_file, stdout=out_file
+                    )
+                    logger.debug(
+                        f"Build process for {self.label} is {self.build_process.pid=}"
+                    )
+                    assert self.build_process is not None
+                    subbuild_failed = False
+                    subbuild_failed_file = action_dir(self.label) / "subbuild_failed"
+                    while True:
                         logger.debug(
-                            f"Build process for {self.label} is {self.build_process.pid=}"
+                            f"Waiting for cmd for {self.label} to finish {self.build_process.pid if self.build_process is not None else None}"
                         )
-                        assert self.build_process is not None
-                        subbuild_failed = False
-                        subbuild_failed_file = (
-                            action_dir(self.label) / "subbuild_failed"
-                        )
-                        while True:
-                            logger.debug(
-                                f"Waiting for cmd for {self.label} to finish {self.build_process.pid=}"
+                        try:
+                            assert self.build_process is not None
+                            self.action_setup_record.return_code = (
+                                self.build_process.wait(1.0)
                             )
-                            procs = [
-                                self.build_process,
-                                self.fuse_mount,
-                            ]
-                            gone, alive = psutil.wait_procs(procs, timeout=1.0)
-                            if self.build_process in gone:
-                                self.action_setup_record.return_code = (
-                                    self.build_process.returncode
-                                )
-                                logger.info(
-                                    f"Running command for {self.label} finished {self.action_setup_record.return_code=}"
-                                )
-                                self.build_process = None
-                                break
-                            if self.fuse_mount in gone:
-                                logger.error(
-                                    f"Fuse mount exited too early with return code {self.fuse_mount.returncode}"
-                                )
-                                self.action_setup_record.return_code = -1
-                                self.fuse_mount = None
-                                kill_subprocess(self.build_process)
-                                break
-                            subbuild_failed = subbuild_failed_file.exists()
-                            if subbuild_failed and self.build_process is not None:
-                                logger.info(
-                                    f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}"
-                                )
-                                kill_subprocess(self.build_process)
-                            if (
-                                subbuild_failed
-                                and self.action_setup_record.return_code is None
-                            ):
-                                logger.info(
-                                    f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}, setting return code to -1"
-                                )
+                            self.build_process = None
+                            break
+                        except psutil.TimeoutExpired:
+                            pass
 
-                                self.action_setup_record.return_code = -1
-            except Exception as e:
-                logger.error(
-                    f"Something went wrong when spawning {self.directory} / {self.name}: {e=}"
-                )
-                if self.build_process is not None:
-                    kill_subprocess(self.build_process)
-                if self.fuse_mount is not None:
-                    unmount(mountpoint)
-                    kill_subprocess(self.fuse_mount)
-                    assert len(list(mountpoint.iterdir())) == 0
-                    self.fuse_mount = None
-                raise
+                        if not self.fuse_mount.is_running():
+                            logger.error("Fuse mount exited too early")
+                            assert self.build_process is not None
+                            self.action_setup_record.return_code = -1
+                            break
 
+                        subbuild_failed = subbuild_failed_file.exists()
+                        if subbuild_failed:
+                            logger.info(
+                                f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}, setting return code to -1"
+                            )
+                            self.action_setup_record.return_code = -1
             logger.debug(f"{self.cmd} done: {self.action_setup_record.return_code}")
 
             logger.debug(
@@ -947,47 +916,71 @@ class BasicAction(ActionBase):
 
             assert self.action_setup_record.return_code is not None
             self.mark_as_done(self.action_setup_record.return_code)
-            return self.action_setup_record.return_code
+        except Exception as e:
+            logger.error(
+                f"Something went wrong when spawning {self.directory} / {self.name}: {e=}"
+            )
+            raise
         finally:
             logger.debug(f"Finally {mountpoint}")
             count = 0
-            while self.fuse_mount is not None:
+            while (
+                self.build_process is not None
+                or self.fuse_mount is not None
+                or os.path.ismount(mountpoint)
+            ):
                 count += 1
                 quite = count < 10
-                if os.path.ismount(mountpoint) and not unmount(mountpoint, quite=quite):
-                    lc = logger.debug if quite else logger.error
-                    lc(f"Failed to unmount {mountpoint} {count=}")
-                else:
-                    logger.debug(f"Called unmount")
-                    assert len(list(mountpoint.iterdir())) == 0
+                if self.build_process is not None:
+                    try:
+                        return_code = self.build_process.wait(1.0)
+                        logger.debug(f"build process stopped: {return_code}")
+                        # too late to use a good return code, something is wrong if it build process was running here
+                        self.build_process = None
+                    except psutil.TimeoutExpired:
+                        logger.debug("Timeput while waiting for build process to stop")
+                        assert self.fuse_mount is not None
+                        if count > 60:
+                            kill_subprocess(self.fuse_mount)
+                    except Exception as e:
+                        logger.error(f"Error while waiting for fuse mount to stop: {e}")
 
-                try:
-                    fuse_return_code = self.fuse_mount.wait(1.0)
-                    logger.debug(f"Fuse mount stopped: {fuse_return_code}")
-                    if fuse_return_code != 0:
-                        logger.error(
-                            f"Fuse mount didn't return ok: {fuse_return_code=}"
-                        )
-                        self.action_setup_record.return_code = -1
-                    self.fuse_mount = None
-                except psutil.TimeoutExpired:
-                    logger.debug("Timeput while waiting for fuse mount to stop")
-                    assert self.fuse_mount is not None
-                    if count > 60:
-                        kill_subprocess(self.fuse_mount)
-                except Exception as e:
-                    logger.error(f"Error while waiting for fuse mount to stop: {e}")
+                if os.path.ismount(mountpoint):
+                    if not unmount(mountpoint, quite=quite):
+                        lc = logger.debug if quite else logger.error
+                        lc(f"Failed to unmount {mountpoint} {count=}")
+                    else:
+                        logger.debug(f"Called unmount")
 
-            logger.debug(f"Joined")
-            assert len(list(mountpoint.iterdir())) == 0
-            merge_access_logs(self.label)
-            with self.last_definition().open("w") as f:
-                first_line = self.action_setup_record
-                schema = class_schema(ActionSetupRecorder)()
-                first_dict = schema.dump(first_line)
-                f.write(json.dumps(first_dict) + "\n")
+                if not os.path.ismount(mountpoint) and self.fuse_mount is not None:
+                    try:
+                        fuse_return_code = self.fuse_mount.wait(1.0)
+                        logger.debug(f"Fuse mount stopped: {fuse_return_code}")
+                        if fuse_return_code != 0:
+                            logger.error(
+                                f"Fuse mount didn't return ok: {fuse_return_code=}"
+                            )
+                            self.action_setup_record.return_code = -1
+                        self.fuse_mount = None
+                    except psutil.TimeoutExpired:
+                        logger.debug("Timeput while waiting for fuse mount to stop")
+                        assert self.fuse_mount is not None
+                        if count > 60:
+                            kill_subprocess(self.fuse_mount)
+                    except Exception as e:
+                        logger.error(f"Error while waiting for fuse mount to stop: {e}")
 
-            self.release_lock()
+        logger.debug(f"Joined")
+        assert len(list(mountpoint.iterdir())) == 0
+        merge_access_logs(self.label)
+        with self.last_definition().open("w") as f:
+            first_line = self.action_setup_record
+            schema = class_schema(ActionSetupRecorder)()
+            first_dict = schema.dump(first_line)
+            f.write(json.dumps(first_dict) + "\n")
+
+        self.release_lock()
+        return self.action_setup_record.return_code
 
     def release_lock(self) -> None:
         self.status = StatusEnum.DONE
