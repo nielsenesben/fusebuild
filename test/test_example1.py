@@ -30,6 +30,7 @@ def create_tcp_server() -> socket.socket:
     # Listen for incoming connections
     sock.listen(1)
 
+    sock.settimeout(60.0)
     return sock
 
 
