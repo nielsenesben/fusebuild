@@ -13,7 +13,7 @@ shell_action(
     cmd="\n".join(
         [
             "cp file1.txt $OUTPUT_DIR/file1_copied1.txt",
-            'nc localhost $TEST_PORT < /dev/zero || echo "nc failed"',
+            "nc localhost $TEST_PORT < /dev/zero",
             "cp file1.txt $OUTPUT_DIR/file1_copied2.txt",
         ]
     ),
