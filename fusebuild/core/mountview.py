@@ -7,7 +7,8 @@ import marshmallow_dataclass2
 from .access_recorder import AccessRecorder, new_access_log_file
 from .action import Action, ActionLabel
 from .file_layout import action_dir, action_folder_root_str, output_folder_root_str
-from .libfusebuild import ActionBase, BasicMount, check_build_target
+from .fuse_mount import BasicMount
+from .libfusebuild import ActionBase, check_build_target
 from .logger import getLogger, setLoggerPrefix
 
 logger = getLogger(__name__)
