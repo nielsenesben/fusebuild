@@ -233,7 +233,7 @@ class Status:
     running_pid: Optional[int] = os.getpid()
 
 
-class ActionBase(ActionInvoker):
+class ExecuterBase(ActionInvoker):
     def __init__(self, label: ActionLabel):
         self._waiting_for: dict[ActionLabel, int] = {}
         self.label = label
@@ -318,7 +318,7 @@ class ActionBase(ActionInvoker):
         return WaitingForImpl()
 
 
-class BasicAction(ActionBase):
+class BasicExecuter(ExecuterBase):
     def __init__(self, label: ActionLabel, action: Action):
         super().__init__(label)
         self.action_setup_record = ActionSetupRecorder(action, os_environ())
@@ -747,16 +747,16 @@ class BasicAction(ActionBase):
 def check_deadlock_inner(
     seen: set[ActionLabel], label: ActionLabel
 ) -> list[ActionLabel]:
-    action = ActionBase(label)
+    executer = ExecuterBase(label)
     seen_next = seen.union([label])
-    with action.get_status_lock_file().acquire(blocking=False):
-        status = action._read_status()
+    with executer.get_status_lock_file().acquire(blocking=False):
+        status = executer._read_status()
         if status is None or status.status == StatusEnum.DONE:
             return []
         if not status.running_pid or not check_pid(status.running_pid):
             return []
 
-        for l in action._read_waiting_for():
+        for l in executer._read_waiting_for():
             if l in seen:
                 return [label, l]
             deadlock_list = check_deadlock_inner(seen_next, l)
@@ -781,7 +781,7 @@ def check_deadlock(label: ActionLabel, reason: str) -> bool:
         return False
 
 
-class LoadBuildFileAction(BasicAction):
+class LoadBuildFileExecuter(BasicExecuter):
     def __init__(self, buildfile: Path) -> None:
         buildfile = buildfile.absolute()
         cmd = [
@@ -792,8 +792,7 @@ class LoadBuildFileAction(BasicAction):
         ]
 
         self.buildfile = buildfile
-        BasicAction.__init__(
-            self,
+        super(LoadBuildFileExecuter, self).__init__(
             ActionLabel(buildfile.parent, "FUSEBUILD.py"),
             Action(cmd, category="", tmp=RandomTmpDir()),
         )
@@ -812,19 +811,19 @@ class LoadBuildFileAction(BasicAction):
             json.dump(schema.dump(self.action), f)
 
 
-class RuleAction(BasicAction):
+class ActionExecuter(BasicExecuter):
     def __init__(self, label: ActionLabel, action: Action) -> None:
-        super(RuleAction, self).__init__(label, action)
+        super(ActionExecuter, self).__init__(label, action)
 
 
 def clean_nonexisting_action(path: Path, name: str) -> None:
     logger.info(f"Clean non-exsisting target {path}/{name}")
     empty_action = Action(cmd=[], category="internal_clean")
-    action = RuleAction(ActionLabel(path, name), empty_action)
-    action.require_for_build()
-    action.clean()
-    action.status = StatusEnum.DELETED
-    action.write_status()
+    executer = ActionExecuter(ActionLabel(path, name), empty_action)
+    executer.require_for_build()
+    executer.clean()
+    executer.status = StatusEnum.DELETED
+    executer.write_status()
 
 
 visited_directories: set[Path] = set([])
@@ -876,11 +875,11 @@ def check_build_file(
     buildfile = buildfile.absolute()
     if not buildfile.exists():
         return Err(None)
-    action = LoadBuildFileAction(buildfile)
-    ret = action.run_if_needed(invoker, reason)
+    executer = LoadBuildFileExecuter(buildfile)
+    ret = executer.run_if_needed(invoker, reason)
     logger.debug(f"run_if_needed for {buildfile}: {ret}")
     if ret is not None:
-        action.release_lock()
+        executer.release_lock()
     logger.debug(f"LoadBuildFileAction({buildfile}) {ret=}")
     if ret != 0 and ret is not None:
         return Err(ret)
@@ -898,9 +897,6 @@ def get_action(
     path = path.resolve()
     if path.is_file():
         path = path.parent
-
-    if action == "FUSEBUILD.py":
-        return LoadBuildFileAction(path / "FUSEBUILD.py").action
 
     label = ActionLabel(path, action)
     if label in loaded_actions:
@@ -925,12 +921,14 @@ def get_action(
     return loaded_actions[label]
 
 
-def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> BasicAction | None:
+def get_action_executer(
+    p: Path, name: str, invoker: ActionInvoker
+) -> BasicExecuter | None:
     if name == "FUSEBUILD.py":
-        return LoadBuildFileAction(p / name)
+        return LoadBuildFileExecuter(p / name)
 
     action = get_action(p, name, invoker)
-    logger.debug(f"get_rule_action({p}, {name}) = {action}")
+    logger.debug(f"get_action_executer({p}, {name}) = {action}")
     match action:
         case None:
             return None
@@ -940,7 +938,7 @@ def get_rule_action(p: Path, name: str, invoker: ActionInvoker) -> BasicAction |
             p = p.resolve()
             if p.is_file():
                 p = p.parent
-            return RuleAction(ActionLabel(p, name), action)
+            return ActionExecuter(ActionLabel(p, name), action)
 
 
 def get_action_from_path(

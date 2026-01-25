@@ -16,7 +16,7 @@ from .file_layout import (
     output_folder_root_str,
 )
 from .fuse_mount import BasicMount
-from .libfusebuild import ActionBase, check_build_target
+from .libfusebuild import ExecuterBase, check_build_target
 from .logger import getLogger, setLoggerPrefix
 
 logger = getLogger(__name__)
@@ -54,7 +54,7 @@ def main(label: ActionLabel) -> int:
             """
             + Fuse.fusage
         )
-        invoker = ActionBase(label)
+        invoker = ExecuterBase(label)
         fuse_server = BasicMount(
             label,
             invoker,

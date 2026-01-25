@@ -35,14 +35,11 @@ from .file_layout import (
 )
 from .graph import sort_graph
 from .libfusebuild import (
-    ActionBase,
-    BasicAction,
+    BasicExecuter,
+    ExecuterBase,
+    Status,
     StatusEnum,
-    all_actions,
-    check_build_file,
-    find_all_actions,
-    get_action,
-    get_rule_action,
+    get_action_executer,
     load_actions,
     run_action_cmd_env,
 )
@@ -76,7 +73,7 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
         print(f"Deadlock detected at {label}", file=sys.stderr)
         print_output(label)
         return
-    action = ActionBase(label)
+    action = ExecuterBase(label)
     try:
         with action.get_status_lock_file().acquire(blocking=False):
             status = action._read_status()
