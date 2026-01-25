@@ -21,10 +21,10 @@ from fusebuild.core.access_recorder import AccessRecorder
 from fusebuild.core.action import ActionLabel, MappingDefinition
 from fusebuild.core.action_invoker import ActionInvoker
 from fusebuild.core.file_layout import (
-    action_dir,
     is_rule_output,
     output_folder_root,
     output_folder_root_str,
+    subbuild_failed_file,
 )
 
 # pull in some spaghetti to make this stuff work without fuse-py being installed
@@ -118,7 +118,7 @@ class BasicMount(Fuse):  # type: ignore
             if label is not None:
                 self.access_recorder.action_deps.add(label)
             if not success:
-                with (action_dir(self.label) / "subbuild_failed").open("a") as f:
+                with subbuild_failed_file(self.label).open("a") as f:
                     if label is None:
                         f.write("something odd")
                     else:

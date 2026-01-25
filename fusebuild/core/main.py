@@ -25,10 +25,16 @@ from result import Err, Ok
 from .access_recorder import load_action_deps
 from .action import Action, ActionLabel, label_from_line
 from .action_invoker import ActionInvoker, DummyInvoker
-from .file_layout import action_dir
+from .file_layout import (
+    FUSEBUILD_INVOCATION_DIR,
+    action_dir,
+    status_lock_file,
+    stderr_file,
+    stdout_file,
+    subbuild_failed_file,
+)
 from .graph import sort_graph
 from .libfusebuild import (
-    FUSEBUILD_INVOCATION_DIR,
     ActionBase,
     BasicAction,
     StatusEnum,
@@ -55,11 +61,11 @@ def copy_file_to_stderr(name: Path) -> None:
 
 
 def print_output(label: ActionLabel) -> None:
-    stderr_out = action_dir(label) / "stderr"
+    stderr_out = stderr_file(label)
     if stderr_out.exists():
         print(f"Stderr of {label}:", file=sys.stderr)
         copy_file_to_stderr(stderr_out)
-    stdout_out = action_dir(label) / "stdout"
+    stdout_out = stdout_file(label)
     if stdout_out.exists():
         print(f"Stdout of {label}:", file=sys.stderr)
         copy_file_to_stderr(stdout_out)
@@ -83,10 +89,10 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
                     f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed"
                 )
                 return
-            subbuild_failed_file = action_dir(label) / "subbuild_failed"
-            if subbuild_failed_file.exists():
+            subbuild_failed_path = subbuild_failed_file(label)
+            if subbuild_failed_path.exists():
                 seen2 = seen.union({label})
-                with subbuild_failed_file.open("r") as f:
+                with subbuild_failed_path.open("r") as f:
                     for line in set(f.readlines()):
                         failed_label = label_from_line(line)
                         print(f"{label} failed due to {failed_label}", file=sys.stderr)
@@ -94,7 +100,7 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
             else:
                 print_output(label)
     except filelock.Timeout as to:
-        subprocess.run(["fuser", str(action.storage / "status.lck")])
+        subprocess.run(["fuser", str(status_lock_file(label))])
         subprocess.run(["ps", "auxfwwww"])
         print(
             f"Can't get lock in {label}, and print further information.",

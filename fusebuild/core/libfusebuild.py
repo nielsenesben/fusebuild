@@ -46,11 +46,8 @@ from watchdog.observers import Observer
 import fusebuild.core.logger as logger_module
 from fusebuild.core.access_recorder import (
     AccessRecorder,
-    access_log_file,
-    action_deps_file,
     check_accesses,
     merge_access_logs,
-    new_access_log_file,
 )
 from fusebuild.core.action import (
     Action,
@@ -63,11 +60,26 @@ from fusebuild.core.action import (
 )
 from fusebuild.core.dependency import ActionSetupRecorder
 from fusebuild.core.file_layout import (
+    FUSEBUILD_INVOCATION_DIR,
+    access_log_file,
+    action_deps_file,
     action_dir,
     fusebuild_folder,
+    has_invocation_dir,
+    invocation_failed_file,
+    invocation_ok_file,
     is_rule_output,
+    last_definition_file,
+    mountpoint_dir,
+    new_access_log_file,
     output_folder_root,
     output_folder_root_str,
+    status_file,
+    status_lock_file,
+    stderr_file,
+    stdout_file,
+    subbuild_failed_file,
+    waiting_for_file,
 )
 
 from .action_invoker import ActionInvoker, WaitingFor
@@ -75,8 +87,6 @@ from .fuse_mount import BasicMount, unmount
 
 logger = logger_module.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)
-
-FUSEBUILD_INVOCATION_DIR = "FUSEBUILD_INVOCATION_DIR"
 
 
 def os_environ() -> dict[str, str]:
@@ -179,21 +189,13 @@ def check_build_target(
         logger.debug(f"{label} was in dependencies_ok")
         return True, label
 
-    if FUSEBUILD_INVOCATION_DIR in os.environ:
-        if Path(
-            os.environ[FUSEBUILD_INVOCATION_DIR] + "/ok/" + str(src_dir) + "/" + target
-        ).exists():
+    if has_invocation_dir():
+        if invocation_ok_file(label).exists():
             logger.debug(f"{label} was present in ok dir.")
             dependencies_ok[label] = True
             return True, label
 
-        if Path(
-            os.environ[FUSEBUILD_INVOCATION_DIR]
-            + "/failed/"
-            + str(src_dir)
-            + "/"
-            + target
-        ).exists():
+        if invocation_failed_file(label).exists():
             logger.debug(f"{label} was already marked as failed.")
             return False, label
 
@@ -237,7 +239,7 @@ class ActionBase(ActionInvoker):
         self.label = label
         self.full_path = self.directory / self.name
         logger.debug(f"{self.full_path=}")
-        self.storage = fusebuild_folder / ("actions" + str(self.full_path))
+        self.storage = action_dir(label)
         logger.debug(f"{self.storage=}")
 
     @property
@@ -253,7 +255,7 @@ class ActionBase(ActionInvoker):
 
     @property
     def waiting_for_file(self) -> Path:
-        return self.storage / "waiting_for"
+        return waiting_for_file(self.label)
 
     def _write_waiting_for(self) -> None:
         logger.debug(
@@ -273,15 +275,15 @@ class ActionBase(ActionInvoker):
         return self._waiting_for
 
     def get_status_lock_file(self) -> filelock.FileLock:
-        return filelock.FileLock(str(self.storage / "status.lck"))
+        return filelock.FileLock(str(status_lock_file(self.label)))
 
     def _read_status(self) -> Optional[Status]:
-        status_file = self.storage / "status.json"
-        if not status_file.exists():
+        status_file_path = status_file(self.label)
+        if not status_file_path.exists():
             return None
 
         schema = marshmallow_dataclass2.class_schema(Status)()
-        with (status_file).open("r") as f:
+        with status_file_path.open("r") as f:
             d = json.load(f)
             return schema.load(d)
 
@@ -345,11 +347,11 @@ class BasicAction(ActionBase):
     def mark_as_done(self, retcode: int) -> None:
         if retcode == 0:
             dependencies_ok[self.label] = True
-        if FUSEBUILD_INVOCATION_DIR in os.environ:
-            done_file = Path(
-                os.environ[FUSEBUILD_INVOCATION_DIR]
-                + ("/ok/" if retcode == 0 else "/failed/")
-                + str(self.full_path)
+        if has_invocation_dir():
+            done_file = (
+                invocation_ok_file(self.label)
+                if retcode == 0
+                else invocation_failed_file(self.label)
             )
             done_file.parent.mkdir(parents=True, exist_ok=True)
             with done_file.open("w") as f:
@@ -359,9 +361,9 @@ class BasicAction(ActionBase):
         self.status = StatusEnum.RUNNING
         self.write_status()
 
-        (action_dir(self.label) / "subbuild_failed").unlink(missing_ok=True)
+        subbuild_failed_file(self.label).unlink(missing_ok=True)
 
-        mountpoint = self.storage / "mountpoint"
+        mountpoint = mountpoint_dir(self.label)
         logger.info(f"{mountpoint=}")
         try:
             unmount(mountpoint, quite=True)  # Expect unmount to fail
@@ -374,7 +376,7 @@ class BasicAction(ActionBase):
         logger.debug(f"{writeable=}")
         writeable.mkdir(parents=True, exist_ok=True)
         cwd = self.directory.absolute()
-        (action_dir(self.label) / "subbuild_failed").unlink(missing_ok=True)
+        subbuild_failed_file(self.label).unlink(missing_ok=True)
         if len(list(mountpoint.iterdir())) > 0:
             logger.error(f"{mountpoint} not empty:  {list(mountpoint.iterdir())=}")
             assert False
@@ -429,8 +431,8 @@ class BasicAction(ActionBase):
 
         try:
             logger.info(f"{spawn_cmd=}  {spawn_env=}")
-            with (self.storage / "stderr").open("wb") as err_file:
-                with (self.storage / "stdout").open("wb") as out_file:
+            with stderr_file(self.label).open("wb") as err_file:
+                with stdout_file(self.label).open("wb") as out_file:
                     self.build_process = psutil.Popen(
                         spawn_cmd, env=spawn_env, stderr=err_file, stdout=out_file
                     )
@@ -439,7 +441,7 @@ class BasicAction(ActionBase):
                     )
                     assert self.build_process is not None
                     subbuild_failed = False
-                    subbuild_failed_file = action_dir(self.label) / "subbuild_failed"
+                    subbuild_failed_path = subbuild_failed_file(self.label)
                     while True:
                         logger.debug(
                             f"Waiting for cmd for {self.label} to finish {self.build_process.pid if self.build_process is not None else None}"
@@ -460,18 +462,18 @@ class BasicAction(ActionBase):
                             self.action_setup_record.return_code = -1
                             break
 
-                        subbuild_failed = subbuild_failed_file.exists()
+                        subbuild_failed = subbuild_failed_path.exists()
                         if subbuild_failed:
                             logger.info(
-                                f"Subbuild for {self.label} failed: {subbuild_failed_file.read_text()}, setting return code to -1"
+                                f"Subbuild for {self.label} failed: {subbuild_failed_path.read_text()}, setting return code to -1"
                             )
                             self.action_setup_record.return_code = -1
             logger.debug(f"{self.cmd} done: {self.action_setup_record.return_code}")
 
             logger.debug(
-                f"Checking {subbuild_failed_file=}: {subbuild_failed_file.exists()}"
+                f"Checking {subbuild_failed_path=}: {subbuild_failed_path.exists()}"
             )
-            subbuild_failed = subbuild_failed_file.exists()
+            subbuild_failed = subbuild_failed_path.exists()
             if subbuild_failed:
                 logger.info("Return code == 0 but subbuild failed")
                 self.action_setup_record.return_code = -1
@@ -571,13 +573,13 @@ class BasicAction(ActionBase):
         schema = marshmallow_dataclass2.class_schema(Status)()
         status_json = json.dumps(schema.dump(status))
 
-        status_file = self.storage / "status.json"
-        logger.debug(f"Writing status {status_json} to {status_file}")
+        status_file_path = status_file(self.label)
+        logger.debug(f"Writing status {status_json} to {status_file_path}")
         try:
-            with status_file.open("w") as f:
+            with status_file_path.open("w") as f:
                 f.write(status_json)
         except Exception as e:
-            logger.error(f"Can't write {status_file}: {e}")
+            logger.error(f"Can't write {status_file_path}: {e}")
             raise e
 
     def write_status(self) -> None:
@@ -595,17 +597,11 @@ class BasicAction(ActionBase):
         )
 
     def last_definition(self) -> Path:
-        return self.storage / "last_definition.json"
+        return last_definition_file(self.label)
 
     def have_ok_file(self) -> bool:
-        if FUSEBUILD_INVOCATION_DIR in os.environ:
-            if Path(
-                os.environ[FUSEBUILD_INVOCATION_DIR]
-                + "/ok/"
-                + str(self.directory)
-                + "/"
-                + self.name
-            ).exists():
+        if has_invocation_dir():
+            if invocation_ok_file(self.label).exists():
                 logger.debug(f"({self.label} in invocation dir")
                 dependencies_ok[self.label] = True
                 return True
@@ -645,7 +641,7 @@ class BasicAction(ActionBase):
                     ) -> None:
                         semaphore.release()
 
-                observer.schedule(StatusChangedEvent(), self.storage / "status.json")
+                observer.schedule(StatusChangedEvent(), status_file(self.label))
                 observer.start()
                 continue  # Run immediately again to avoid loosing an event
 
@@ -727,14 +723,8 @@ class BasicAction(ActionBase):
                 case _:
                     assert False
             if (
-                FUSEBUILD_INVOCATION_DIR in os.environ
-                and (
-                    failed_file := Path(
-                        os.environ[FUSEBUILD_INVOCATION_DIR]
-                        + "/failed/"
-                        + str(self.full_path)
-                    )
-                ).exists()
+                has_invocation_dir()
+                and (failed_file := invocation_failed_file(self.label)).exists()
             ):
                 retcode = int(failed_file.read_text())
                 logger.info(f"{self.label} failed with {retcode=}")
