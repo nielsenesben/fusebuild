@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fusebuild.core.action import ActionLabel
 from fusebuild.core.action_invoker import ActionInvoker, DummyInvoker
-from fusebuild.core.libfusebuild import ActionBase, Status, get_rule_action
+from fusebuild.core.libfusebuild import ExecuterBase, Status, get_action_executer
 from fusebuild.core.logger import getLogger, setLoggerPrefix
 
 logger = getLogger(__name__)
@@ -18,10 +18,10 @@ def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | No
     # os.setpgrp()
     logger.debug(f"Runtarget {buildfile=} {target=} {invoker=}")
     assert buildfile.is_file()
-    action = get_rule_action(buildfile.parent, target, invoker)
-    if action is None:
+    executer = get_action_executer(buildfile.parent, target, invoker)
+    if executer is None:
         return -1
-    return_code = action.run_if_needed(
+    return_code = executer.run_if_needed(
         invoker, f"building {[str(a) for a in invoker.runtarget_args()]}"
     )
     return return_code
@@ -30,7 +30,7 @@ def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | No
 if __name__ == "__main__":
     invoker: ActionInvoker
     if len(sys.argv) > 3:
-        invoker = ActionBase(ActionLabel(Path(sys.argv[3]), sys.argv[4]))
+        invoker = ExecuterBase(ActionLabel(Path(sys.argv[3]), sys.argv[4]))
     else:
         invoker = DummyInvoker()
     setLoggerPrefix(f"runtarget {sys.argv[2]}")

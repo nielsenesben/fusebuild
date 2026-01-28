@@ -4,10 +4,19 @@ from pathlib import Path
 
 import marshmallow_dataclass2
 
-from .access_recorder import AccessRecorder, new_access_log_file
+from .access_recorder import AccessRecorder
 from .action import Action, ActionLabel
-from .file_layout import action_dir, action_folder_root_str, output_folder_root_str
-from .libfusebuild import ActionBase, BasicMount, check_build_target
+from .file_layout import (
+    action_deps_file,
+    action_dir,
+    action_json_file,
+    mountpoint_dir,
+    new_access_log_file,
+    output_dir,
+    output_folder_root_str,
+)
+from .fuse_mount import BasicMount
+from .libfusebuild import ExecuterBase, check_build_target
 from .logger import getLogger, setLoggerPrefix
 
 logger = getLogger(__name__)
@@ -23,34 +32,29 @@ from fuse import Fuse, FuseArgs, FuseError
 
 def main(label: ActionLabel) -> int:
     schema = marshmallow_dataclass2.class_schema(Action)()
-    action_dir_ = action_dir(label)
-    action_file = (
-        Path(str(output_folder_root_str + str(label.path)))
-        / "FUSEBUILD.py"
-        / (label.name + ".json")
-    )
+    action_file = action_json_file(label)
     with action_file.open("r") as f:
         d = json.load(f)
         action = schema.load(d)
 
     logger.debug(f"{action=}")
     access_log = new_access_log_file(label)
-    mountpoint = action_dir_ / "mountpoint"
-    writeable = Path(output_folder_root_str + str(label.path)) / label.name
+    mountpoint = mountpoint_dir(label)
+    writeable = output_dir(label)
     logger.debug(f"Mounting on {mountpoint=} with {writeable=}")
     with access_log.open("w", encoding="utf-8") as access_log_file:
         logger.debug(f"{access_log=}")
         access_recorder = AccessRecorder(
             central_dir=label.path,
             access_log=access_log_file,
-            action_deps_file=action_dir_ / "action_deps.txt",
+            action_deps_file=action_deps_file(label),
         )
         usage = (
             """
             """
             + Fuse.fusage
         )
-        invoker = ActionBase(label)
+        invoker = ExecuterBase(label)
         fuse_server = BasicMount(
             label,
             invoker,

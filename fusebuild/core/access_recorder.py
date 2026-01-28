@@ -29,19 +29,18 @@ from .dependency import (
     check_file_hash,
     get_file_hash,
 )
-from .file_layout import action_dir, is_rule_output, output_folder_root_str
+from .file_layout import (
+    access_log_file,
+    action_deps_file,
+    is_rule_output,
+    new_access_log_file,
+    output_folder_root_str,
+    tmp_access_log_file,
+)
 
 logger = logger_module.getLogger(__name__)
 
 dependency_record_schema = class_schema(DependencyRecord)()
-
-
-def access_log_file(label: ActionLabel) -> Path:
-    return action_dir(label) / "access_log.json"
-
-
-def new_access_log_file(label: ActionLabel) -> Path:
-    return action_dir(label) / "new_access_log.json"
 
 
 def do_nothing() -> None:
@@ -267,12 +266,11 @@ def check_accesses_inner_loop(
 
 
 def merge_access_logs(label: ActionLabel) -> None:
-    action_dir_ = action_dir(label)
     access_log = access_log_file(label)
     new_access_log = new_access_log_file(label)
     if new_access_log.exists():
         if access_log.exists():
-            tmp_access_log = action_dir_ / "tmp_action_log.json"
+            tmp_access_log = tmp_access_log_file(label)
             ret = subprocess.run(
                 f"cat {access_log} {new_access_log} | sort -u > {tmp_access_log}",
                 shell=True,
@@ -305,10 +303,6 @@ def check_accesses(
         print(traceback.format_exc())
         sys.exit(1)
         return False
-
-
-def action_deps_file(label: ActionLabel) -> Path:
-    return action_dir(label) / "action_deps.txt"
 
 
 def load_action_deps(label: ActionLabel | Path) -> list[ActionLabel]:
