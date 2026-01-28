@@ -41,9 +41,9 @@ from .libfusebuild import (
     StatusEnum,
     get_action_executer,
     load_actions,
-    run_action_cmd_env,
 )
 from .logger import FUSEBUILD_LOG_LEVEL, getLogger
+from .utils import run_action_cmd_env
 
 logger = getLogger(__name__)
 
