@@ -888,24 +888,3 @@ def get_action_from_path(
             break
 
     return None
-
-
-def find_all_actions(
-    d: Path, invoker: ActionInvoker
-) -> Result[dict[ActionLabel, Action], set[Path]]:
-    fails: set[Path] = set([])
-    actions: dict[ActionLabel, Action] = {}
-    build_files = d.glob("**/FUSEBUILD.py")
-    for bf in build_files:
-        res = check_build_file(bf, invoker, "finding all actions in {d}")
-        match res:
-            case Err(ret):
-                logger.error(f"Failed to load {bf}: Returned {ret}")
-                fails.add(bf)
-            case Ok(acts):
-                actions.update(acts)
-
-    if len(fails) > 0:
-        return Err(fails)
-    else:
-        return Ok(actions)
