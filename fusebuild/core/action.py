@@ -93,9 +93,14 @@ class BwrapSandbox(Sandbox):
 def fullname(o: Any) -> str:
     klass = o.__class__
     module = klass.__module__
+
+    name: str
     if module == "builtins":
-        return klass.__qualname__  # avoid outputs like 'builtins.str'
-    return module + "." + klass.__qualname__
+        name = klass.__qualname__  # avoid outputs like 'builtins.str'
+    else:
+        name = module + "." + klass.__qualname__
+
+    return name
 
 
 def get_definition(name: str) -> Any:

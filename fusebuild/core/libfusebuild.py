@@ -211,7 +211,8 @@ class ExecuterBase(ActionInvoker):
         schema = marshmallow_dataclass2.class_schema(Status)()
         with status_file_path.open("r") as f:
             d = json.load(f)
-            return schema.load(d)
+            status: Status = schema.load(d)
+            return status
 
     def waiting_for(self, label: ActionLabel) -> AbstractContextManager[WaitingFor]:
         class WaitingForImpl(WaitingFor):
@@ -767,7 +768,7 @@ def load_action_file(label: ActionLabel, action_file: Path) -> Action:
     logger.debug(f"Loading action {label} from {action_file}")
     with action_file.open("r") as f:
         d = json.load(f)
-        action = action_schema.load(d)
+        action: Action = action_schema.load(d)
         for provider in action.providers.values():
             provider.output_dir = (
                 Path(output_folder_root_str + str(label.path)) / label.name
