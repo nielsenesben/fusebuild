@@ -84,83 +84,9 @@ from fusebuild.core.file_layout import (
 
 from .action_invoker import ActionInvoker, WaitingFor
 from .fuse_mount import BasicMount, unmount
+from .utils import check_pid, kill_subprocess, os_environ, run_action
 
 logger = logger_module.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
-
-
-def os_environ() -> dict[str, str]:
-    return {k: os.environ[k] for k in os.environ}
-
-
-def check_pid(pid: int) -> bool:
-    """Check For the existence of a unix pid."""
-    psutil.process_iter.cache_clear()
-    return psutil.pid_exists(pid)
-
-
-def kill_subprocess(process: subprocess.Popen[bytes] | psutil.Popen) -> None:
-    pid = process.pid
-
-    if not check_pid(pid):
-        return
-
-    logger.debug(f"Trying to terminate group {pid=}")
-    try:
-        os.kill(pid, signal.SIGINT)
-    except BaseException as e:
-        logger.warning(f"Failed to send sigterm to {pid=}: {type(e)=} {e}")
-        for p in psutil.process_iter():
-            logger.debug(f"   {p}")
-
-    logger.debug(f"Trying to terminate group {pid=}")
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except BaseException as e:
-        logger.warning(f"Failed to send sigterm to {pid=}: {type(e)=} {e}")
-        for p in psutil.process_iter():
-            logger.debug(f"   {p}")
-
-    start = time.time()
-    while check_pid(pid):
-        time.sleep(0.1)
-        if time.time() - start >= 1.0:
-            break
-
-    if not check_pid(pid):
-        return
-
-    logger.debug(f"Trying to kill process group {pid=}")
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except BaseException as e:
-        logger.warning(f"Failed to send sigkill to {pid=}:  {type(e)=}  {e}")
-
-
-def run_action_cmd_env(
-    directory: Path, target: str, invoker: ActionInvoker
-) -> tuple[list[str], Any]:
-    return [
-        "python3",
-        str(Path(__file__).parent / "runtarget.py"),
-        str(directory.absolute() / "FUSEBUILD.py"),
-        target,
-    ] + invoker.runtarget_args(), os.environ
-
-
-def run_action(directory: Path, target: str, invoker: ActionInvoker) -> int:
-    logger.debug(f"Run action {directory} / {target}")
-    process = None
-    try:
-        cmd, env = run_action_cmd_env(directory, target, invoker)
-        process = psutil.Popen(cmd, env=env)
-        res = process.wait()
-    except:
-        logger.error(f"Something went wrong when invoking {directory} / {target}")
-        if process is not None:
-            kill_subprocess(process)
-        raise
-    return res
 
 
 # Once a dependency is checked in an invocation, it stays ok
@@ -285,7 +211,8 @@ class ExecuterBase(ActionInvoker):
         schema = marshmallow_dataclass2.class_schema(Status)()
         with status_file_path.open("r") as f:
             d = json.load(f)
-            return schema.load(d)
+            status: Status = schema.load(d)
+            return status
 
     def waiting_for(self, label: ActionLabel) -> AbstractContextManager[WaitingFor]:
         class WaitingForImpl(WaitingFor):
@@ -841,7 +768,7 @@ def load_action_file(label: ActionLabel, action_file: Path) -> Action:
     logger.debug(f"Loading action {label} from {action_file}")
     with action_file.open("r") as f:
         d = json.load(f)
-        action = action_schema.load(d)
+        action: Action = action_schema.load(d)
         for provider in action.providers.values():
             provider.output_dir = (
                 Path(output_folder_root_str + str(label.path)) / label.name
@@ -962,24 +889,3 @@ def get_action_from_path(
             break
 
     return None
-
-
-def find_all_actions(
-    d: Path, invoker: ActionInvoker
-) -> Result[dict[ActionLabel, Action], set[Path]]:
-    fails: set[Path] = set([])
-    actions: dict[ActionLabel, Action] = {}
-    build_files = d.glob("**/FUSEBUILD.py")
-    for bf in build_files:
-        res = check_build_file(bf, invoker, "finding all actions in {d}")
-        match res:
-            case Err(ret):
-                logger.error(f"Failed to load {bf}: Returned {ret}")
-                fails.add(bf)
-            case Ok(acts):
-                actions.update(acts)
-
-    if len(fails) > 0:
-        return Err(fails)
-    else:
-        return Ok(actions)

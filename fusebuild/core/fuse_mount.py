@@ -356,7 +356,8 @@ class BasicMount(Fuse):  # type: ignore
                     self.iolock.acquire()
                     try:
                         self.file.seek(offset)
-                        return self.file.read(length)
+                        data: bytes = self.file.read(length)
+                        return data
                     finally:
                         self.iolock.release()
                 else:
@@ -459,7 +460,8 @@ class BasicMount(Fuse):  # type: ignore
         assert not self_outer.mountpoint.is_mount()
         assert self_outer.mountpoint.is_dir()
         assert len(list(self_outer.mountpoint.iterdir())) == 0
-        return Fuse.main(self_outer)
+        ret: int = Fuse.main(self_outer)
+        return ret
 
 
 def unmount(mountpoint: Path, quite: bool = False) -> bool:
