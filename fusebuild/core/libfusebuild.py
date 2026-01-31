@@ -822,6 +822,10 @@ def get_action(
         path = Path(path)
 
     path = path.resolve()
+
+    if action == "FUSEBUILD.py":
+        return LoadBuildFileExecuter(path / "FUSEBUILD.py").action
+
     if path.is_file():
         path = path.parent
 
