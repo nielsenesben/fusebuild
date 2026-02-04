@@ -328,7 +328,6 @@ class BasicExecuter(ExecuterBase):
         super().__init__(label)
         self.action_setup_record = ActionSetupRecorder(action, os_environ())
         self.incremental = False
-        self.building = True
         self.build_process: psutil.Popen | None = None
         self.fuse_mount: psutil.Popen | None = None
 
@@ -934,11 +933,14 @@ def get_action(
 
     path = path.resolve()
 
-    if action == "FUSEBUILD.py":
-        return LoadBuildFileExecuter(path / "FUSEBUILD.py").action
-
     if path.is_file():
         path = path.parent
+
+    if action == "FUSEBUILD.py":
+        if (path / "FUSEBUILD.py").is_file():
+            return LoadBuildFileExecuter(path / "FUSEBUILD.py").action
+        else:
+            return None
 
     label = ActionLabel(path, action)
     if label in loaded_actions:
