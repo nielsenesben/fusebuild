@@ -710,7 +710,7 @@ def check_deadlock(label: ActionLabel, reason: str) -> bool:
 
 class LoadBuildFileExecuter(BasicExecuter):
     def __init__(self, buildfile: Path) -> None:
-        buildfile = buildfile.absolute()
+        buildfile = buildfile.resolve()
         cmd = [
             "python",
             "-m",
