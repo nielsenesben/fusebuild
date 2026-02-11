@@ -137,8 +137,9 @@ class ActionExecuterImpl(ActionExecuter):
     failures: list[BuildAction]
     max_running: int
     invoker: ActionInvoker
+    invocation_dir: Path
 
-    def __init__(self, max_running: int) -> None:
+    def __init__(self, max_running: int, invocation_dir: Path) -> None:
         self.actions = {}
         self.running = {}
         self.waiting = []
@@ -146,6 +147,7 @@ class ActionExecuterImpl(ActionExecuter):
         self.failures = []
         self.max_running = max_running
         self.invoker = DummyInvoker()
+        self.invocation_dir = invocation_dir
 
     def schedule_action(self, action: BuildAction) -> None:
         self.need_resort = True
@@ -238,37 +240,58 @@ class ActionExecuterImpl(ActionExecuter):
             if action.needed:
                 self.failures.append(action)
 
+    async def handle_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        # For now, just log and close the connection
+        peername = writer.get_extra_info("peername")
+        logger.info(f"Received connection from {peername}")
+        writer.close()
+        await writer.wait_closed()
+
     async def run(self) -> int:
-        while True:
-            if len(self.failures) > 0:
-                failure = self.failures[0]
-                print_failure(failure.label, set([]))
-                return 1
+        socket_path = self.invocation_dir / "fusebuild.sock"
+        server = await asyncio.start_unix_server(
+            self.handle_connection, path=str(socket_path)
+        )
+        logger.info(f"Listening on unix socket {socket_path}")
 
-            pre_sort = len(self.waiting)
-            if self.need_resort:
-                self.sort_waiting()
-            assert pre_sort == len(self.waiting)
+        try:
+            while True:
+                if len(self.failures) > 0:
+                    failure = self.failures[0]
+                    print_failure(failure.label, set([]))
+                    return 1
 
-            while len(self.waiting) > 0 and len(self.running) < self.max_running:
-                await self.start_running(self.waiting[0])
-                self.waiting = self.waiting[1:]
+                pre_sort = len(self.waiting)
+                if self.need_resort:
+                    self.sort_waiting()
+                assert pre_sort == len(self.waiting)
 
-            if len(self.running) == 0 and len(self.waiting) == 0:
-                return 0
+                while len(self.waiting) > 0 and len(self.running) < self.max_running:
+                    await self.start_running(self.waiting[0])
+                    self.waiting = self.waiting[1:]
 
-            logger.debug(f"Waiting for one of {len(self.running)} actions.")
-            done, pending = await asyncio.wait(
-                [t for t in self.running.keys()],
-                timeout=10,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if len(done) == 0:
-                logger.debug("timeout")
-                continue
+                if len(self.running) == 0 and len(self.waiting) == 0:
+                    return 0
 
-            for d in done:
-                self.action_done(d)
+                logger.debug(f"Waiting for one of {len(self.running)} actions.")
+                done, pending = await asyncio.wait(
+                    [t for t in self.running.keys()],
+                    timeout=10,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if len(done) == 0:
+                    logger.debug("timeout")
+                    continue
+
+                for d in done:
+                    self.action_done(d)
+        finally:
+            logger.info("Closing unix socket")
+            server.close()
+            await server.wait_closed()
+            socket_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -302,7 +325,8 @@ def main_inner(args: list[str]) -> int:
         logger.info(f"{logger.name} {log_level=}")
     logger.info(f"{arg.verbose=} {logging.getLevelName(log_level)}")
 
-    logger.info(f"Using {os.environ[FUSEBUILD_INVOCATION_DIR]} as invocation dir.")
+    invocation_dir = Path(os.environ[FUSEBUILD_INVOCATION_DIR])
+    logger.info(f"Using {invocation_dir} as invocation dir.")
 
     categories = frozenset(arg.category.split(","))
 
@@ -310,7 +334,9 @@ def main_inner(args: list[str]) -> int:
     max_running = arg.parallel
     if max_running <= 0:
         max_running = cpu_count()
-    executer = ActionExecuterImpl(max_running=max_running)
+    executer = ActionExecuterImpl(
+        max_running=max_running, invocation_dir=invocation_dir
+    )
     for ti in arg.target:
         t: Path = ti.absolute()
         logger.debug(f"Processing {ti} at {os.getcwd()=}: {t=}")
