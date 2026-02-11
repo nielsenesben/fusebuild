@@ -3,6 +3,8 @@ from fusebuild.core.action import BwrapSandbox as BwrapSandbox
 from fusebuild.core.action import NoSandbox as NoSandbox
 from fusebuild.core.action import PatternRemapToOutput as PatternRemapToOutput
 from fusebuild.core.action import Provider as Provider
+from fusebuild.core.action import RandomTmpDir as RandomTmpDir
+from fusebuild.core.action import TmpDir as TmpDir
 from fusebuild.core.actions import action as action
 from fusebuild.core.actions import get_action as get_action
 from fusebuild.core.actions import shell_action as shell_action
