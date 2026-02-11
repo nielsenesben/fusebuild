@@ -148,6 +148,8 @@ class ActionExecuterImpl(ActionExecuter):
         self.max_running = max_running
         self.invoker = DummyInvoker()
         self.invocation_dir = invocation_dir
+        self.open_connections: list[asyncio.StreamWriter] = []
+        self.connection_reader_tasks: set[asyncio.Task[Any]] = set()
 
     def schedule_action(self, action: BuildAction) -> None:
         self.need_resort = True
@@ -240,14 +242,39 @@ class ActionExecuterImpl(ActionExecuter):
             if action.needed:
                 self.failures.append(action)
 
+    async def _read_from_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        peername = writer.get_extra_info("peername")
+        logger.info(f"Start reading from {peername}")
+        try:
+            while not reader.at_eof():
+                line = await reader.readline()
+                if not line:
+                    break
+                logger.info(f"Received from {peername}: {line.decode().strip()}")
+        except asyncio.CancelledError:
+            logger.info(f"Reader task for {peername} cancelled.")
+            raise
+        except Exception as e:
+            logger.error(f"Error reading from {peername}: {e}")
+        finally:
+            logger.info(f"Closing connection from {peername}")
+            if writer in self.open_connections:
+                self.open_connections.remove(writer)
+            writer.close()
+            await writer.wait_closed()
+
     async def handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        # For now, just log and close the connection
         peername = writer.get_extra_info("peername")
         logger.info(f"Received connection from {peername}")
-        writer.close()
-        await writer.wait_closed()
+        self.open_connections.append(writer)
+
+        task = asyncio.create_task(self._read_from_connection(reader, writer))
+        self.connection_reader_tasks.add(task)
+        task.add_done_callback(self.connection_reader_tasks.discard)
 
     async def run(self) -> int:
         socket_path = self.invocation_dir / "fusebuild.sock"
@@ -292,6 +319,21 @@ class ActionExecuterImpl(ActionExecuter):
             server.close()
             await server.wait_closed()
             socket_path.unlink(missing_ok=True)
+
+            if self.connection_reader_tasks:
+                logger.info(
+                    f"Closing {len(self.connection_reader_tasks)} client connections"
+                )
+                tasks = list(self.connection_reader_tasks)
+                for task in tasks:
+                    task.cancel()
+
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            if self.open_connections:
+                logger.warning(
+                    f"{len(self.open_connections)} connections were not cleaned up properly."
+                )
 
 
 @dataclass(frozen=True)
