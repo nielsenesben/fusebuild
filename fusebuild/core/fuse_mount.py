@@ -15,7 +15,7 @@ import subprocess
 from errno import EACCES, EINVAL, EOPNOTSUPP
 from pathlib import Path
 from threading import Lock
-from typing import Any, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from fusebuild.core.access_recorder import AccessRecorder
 from fusebuild.core.action import ActionLabel, MappingDefinition
@@ -68,6 +68,9 @@ class BasicMount(Fuse):  # type: ignore
         mountpoint: Path,
         access_recorder: AccessRecorder,
         writeable: str,
+        check_build_target: Callable[
+            [Path, ActionInvoker], tuple[bool, ActionLabel | None]
+        ],
         mappings: list[MappingDefinition] = [],
         *args: Any,
         **kw: Any,
@@ -79,6 +82,7 @@ class BasicMount(Fuse):  # type: ignore
         self.fuse_args.mountpoint = str(mountpoint.absolute())
         self.fuse_args.optlist = ["auto_unmount", "intr"]
         self.mountpoint = mountpoint
+        self.check_build_target = check_build_target
         self.subbuild_failed = False
 
         Fuse.__init__(self, *args, fuse_args=self.fuse_args, **kw)
@@ -92,9 +96,6 @@ class BasicMount(Fuse):  # type: ignore
         return is_rule_output(path)
 
     def handle_other_rule_output(self, path: str) -> None:
-        # Import here to avoid circular dependency
-        from fusebuild.core.libfusebuild import check_build_target
-
         if not self.is_rule_output(path):
             return
 
@@ -114,7 +115,7 @@ class BasicMount(Fuse):  # type: ignore
             self.access_recorder.record_dir_exists(src_dir, True)
         else:
             self.access_recorder.record_dir_exists(src_dir, False)
-            success, label = check_build_target(src_dir, self.invoker)
+            success, label = self.check_build_target(src_dir, self.invoker)
             if label is not None:
                 self.access_recorder.action_deps.add(label)
             if not success:

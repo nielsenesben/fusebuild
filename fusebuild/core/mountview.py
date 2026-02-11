@@ -64,6 +64,7 @@ def main(label: ActionLabel) -> int:
             usage=usage,
             dash_s_do="setsingle",
             writeable=str(writeable),
+            check_build_target=check_build_target,
             mappings=action.mappings,
         )
         res = fuse_server.main()
