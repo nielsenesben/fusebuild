@@ -33,7 +33,6 @@ from .file_layout import (
     stdout_file,
     subbuild_failed_file,
 )
-from .graph import sort_graph
 from .libfusebuild import (
     BasicExecuter,
     ExecuterBase,
@@ -108,18 +107,47 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
 
 
 class BuildActionStatus(Enum):
-    IN_QUEUE = 0
-    RUNNING = 1
-    SUCCESSFULL = 2
-    FAILED = 3
+    WAITING = 0
+    RUNABLE = 1
+    RUNNING = 2
+    BLOCKED = 3
+    BLOCKED_RUNABLE = 4
+    SUCCESSFULL = 5
+    FAILED = 6
+
+
+# Possible transitions:
+# WAITING -> RUNABLE when all deps are done
+# RUNABLE -> RUNNING when start runnning
+# RUNNING -> BLOCKED when unknown deps are found while running
+# BLOCKED -> BLOCKED_RUNABLE when blocker have finished
+# RUNNING -> SUCCESSFULL when done with return code 0
+# RUNNING -> FAILED when done with return code non-zero 0
+
+
+def waiting_status(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.WAITING or s == BuildActionStatus.BLOCKED
+
+
+def have_not_started(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.WAITING or s == BuildActionStatus.RUNABLE
+
+
+def runable_status(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.RUNABLE or s == BuildActionStatus.BLOCKED_RUNABLE
+
+
+def finished_status(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.SUCCESSFULL or s == BuildActionStatus.FAILED
 
 
 @dataclass
 class BuildAction:
     label: ActionLabel
     needed: bool
-    status: BuildActionStatus = BuildActionStatus.IN_QUEUE
+    status: BuildActionStatus = BuildActionStatus.WAITING
     deps: set[ActionLabel] = field(default_factory=set)
+    dependers: set[ActionLabel] = field(default_factory=set)
     done_actions: set[Callable[[], None]] = field(default_factory=set)
 
 
@@ -131,9 +159,11 @@ class ActionExecuter(Protocol):
 
 class ActionExecuterImpl(ActionExecuter):
     actions: dict[ActionLabel, BuildAction]
-    running: dict[asyncio.Task[Any], tuple[asyncio.subprocess.Process, BuildAction]]
-    waiting: list[BuildAction]
-    need_resort: bool
+    waiting: set[ActionLabel]
+    runable: set[ActionLabel]
+    started: dict[asyncio.Task[Any], tuple[asyncio.subprocess.Process, BuildAction]]
+    blocked: set[ActionLabel]
+    blocked_runable: set[ActionLabel]
     failures: list[BuildAction]
     max_running: int
     invoker: ActionInvoker
@@ -141,8 +171,11 @@ class ActionExecuterImpl(ActionExecuter):
 
     def __init__(self, max_running: int, invocation_dir: Path) -> None:
         self.actions = {}
-        self.running = {}
-        self.waiting = []
+        self.waiting = set([])
+        self.runable = set([])
+        self.started = {}
+        self.blocked = set([])
+        self.blocked_runable = set([])
         self.need_resort = False
         self.failures = []
         self.max_running = max_running
@@ -150,6 +183,45 @@ class ActionExecuterImpl(ActionExecuter):
         self.invocation_dir = invocation_dir
         self.open_connections: list[asyncio.StreamWriter] = []
         self.connection_reader_tasks: set[asyncio.Task[Any]] = set()
+
+    def _update_dependers(self, action: BuildAction) -> None:
+        for d in action.deps:
+            self.actions[d].dependers.add(action.label)
+
+    def _waiting_or_runable(self, action: BuildAction) -> None:
+        if waiting_status(action.status) or runable_status(action.status):
+            undone_dep = False
+            for d in action.deps:
+                if not finished_status(self.actions[d].status):
+                    undone_deps = True
+                    break
+
+            match action.status:
+                case BuildActionStatus.BLOCKED | BuildActionStatus.BLOCKED_RUNABLE:
+                    if undone_dep:
+                        action.status = BuildActionStatus.BLOCKED
+                        self.blocked.add(action.label)
+                        self.blocked_runable.discard(action.label)
+                    else:
+                        action.status = BuildActionStatus.BLOCKED_RUNABLE
+                        self.blocked_runable.add(action.label)
+                        self.blocked.discard(action.label)
+
+                case BuildActionStatus.WAITING | BuildActionStatus.RUNABLE:
+                    if undone_dep:
+                        action.status = BuildActionStatus.WAITING
+                        self.waiting.add(action.label)
+                        self.runable.discard(action.label)
+                    else:
+                        action.status = BuildActionStatus.RUNABLE
+                        self.runable.add(action.label)
+                        self.waiting.discard(action.label)
+
+                case _:
+                    assert False
+
+    def running(self) -> int:
+        return len(self.started) - len(self.blocked) - len(self.blocked_runable)
 
     def schedule_action(self, action: BuildAction) -> None:
         self.need_resort = True
@@ -159,9 +231,12 @@ class ActionExecuterImpl(ActionExecuter):
             old_action.deps.update(action.deps)
             old_action.done_actions.update(action.done_actions)
             old_action.needed = old_action.needed or action.needed
+            # old_action dependenders already done, only new ones
+            self._update_dependers(action)
+            self._waiting_or_runable(old_action)
         else:
             self.actions[action.label] = action
-            self.waiting.append(action)
+            self.waiting.add(action.label)
             for d in load_action_deps(action.label):
                 logger.debug(f"Adding dependency {d} for {action.label}")
                 action.deps.add(d)
@@ -175,48 +250,15 @@ class ActionExecuterImpl(ActionExecuter):
                 if bf_label not in self.actions:
                     self.schedule_action(BuildAction(bf_label, needed=True))
 
-    def sort_waiting(self) -> None:
-        graph: dict[ActionLabel, list[ActionLabel]] = {}
-
-        def members() -> Iterable[BuildAction]:
-            for a in self.waiting:
-                assert a.status == BuildActionStatus.IN_QUEUE
-                yield a
-            for ta in self.running.values():
-                assert ta[1].status == BuildActionStatus.RUNNING
-                yield ta[1]
-
-        for a in members():
-            graph[a.label] = [
-                d
-                for d in a.deps
-                if self.actions[d].status
-                in [BuildActionStatus.IN_QUEUE, BuildActionStatus.RUNNING]
-            ]
-        assert len(graph) == len(self.waiting) + len(self.running)
-        sorted_actions = sort_graph(graph)
-        assert len(sorted_actions) == len(graph)
-        waiting_new = [
-            self.actions[al]
-            for al in sorted_actions
-            if self.actions[al].status == BuildActionStatus.IN_QUEUE
-        ]
-        waiting_new_labels = set([a.label for a in waiting_new])
-        waiting_old_labels = set([a.label for a in self.waiting])
-        if waiting_new_labels != waiting_old_labels:
-            logger.error(
-                f"Missing in new labels: {waiting_old_labels - waiting_new_labels}"
-            )
-            logger.error(
-                f"New in new labels: {waiting_new_labels - waiting_old_labels}"
-            )
-            assert False
-        self.waiting = waiting_new
+            self._update_dependers(action)
+            self._waiting_or_runable(action)
 
     async def start_running(self, action: BuildAction) -> None:
         logger.debug(f"Starting {action.label}")
         print(f"{action.label}..")
-        assert action.status == BuildActionStatus.IN_QUEUE
+        assert have_not_started(action.status)
+        self.waiting.discard(action.label)
+        self.runable.discard(action.label)
         action.status = BuildActionStatus.RUNNING
         cmd, env = run_action_cmd_env(
             action.label.path, action.label.name, self.invoker
@@ -224,12 +266,11 @@ class ActionExecuterImpl(ActionExecuter):
         proc = await asyncio.create_subprocess_exec(*cmd, env=env)
         logger.debug(f"Running {cmd} with env {env} in {proc.pid=}")
         task = asyncio.create_task(proc.wait())
-        self.running[task] = (proc, action)
-        action.status = BuildActionStatus.RUNNING
+        self.started[task] = (proc, action)
 
     def action_done(self, task: asyncio.Task[Any]) -> None:
-        assert task in self.running
-        process, action = self.running.pop(task)
+        assert task in self.started
+        process, action = self.started.pop(task)
         logger.debug(f"{action.label}: {process.returncode}")
         if process.returncode == 0:
             action.status = BuildActionStatus.SUCCESSFULL
@@ -241,6 +282,9 @@ class ActionExecuterImpl(ActionExecuter):
             action.status = BuildActionStatus.FAILED
             if action.needed:
                 self.failures.append(action)
+
+        for d in action.dependers:
+            self._waiting_or_runable(self.actions[d])
 
     async def _read_from_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -276,6 +320,32 @@ class ActionExecuterImpl(ActionExecuter):
         self.connection_reader_tasks.add(task)
         task.add_done_callback(self.connection_reader_tasks.discard)
 
+    async def unblock(self, action: BuildAction) -> None:
+        # TODO
+        assert False
+
+    def pick_waiter(self) -> BuildAction:
+        return self.pick_one(self.waiting)
+
+    def pick_one(self, runables: set[ActionLabel]) -> BuildAction:
+        best = None
+        best_count = -1
+        for label in runables:
+            action = self.actions[label]
+            c = len(
+                [
+                    l
+                    for l in action.dependers
+                    if not finished_status(self.actions[l].status)
+                ]
+            )
+            if c > best_count:
+                best_count = c
+                best = action
+
+        assert best is not None
+        return best
+
     async def run(self) -> int:
         socket_path = self.invocation_dir / "fusebuild.sock"
         server = await asyncio.start_unix_server(
@@ -290,21 +360,29 @@ class ActionExecuterImpl(ActionExecuter):
                     print_failure(failure.label, set([]))
                     return 1
 
-                pre_sort = len(self.waiting)
-                if self.need_resort:
-                    self.sort_waiting()
-                assert pre_sort == len(self.waiting)
+                while self.running() < self.max_running:
+                    if len(self.blocked_runable) > 0:
+                        await self.unblock(self.pick_one(self.blocked_runable))
+                    elif len(self.runable) > 0:
+                        await self.start_running(self.pick_one(self.runable))
+                    else:
+                        break
 
-                while len(self.waiting) > 0 and len(self.running) < self.max_running:
-                    await self.start_running(self.waiting[0])
-                    self.waiting = self.waiting[1:]
+                if (
+                    self.running() == 0
+                    and len(self.runable) == 0
+                    and len(self.waiting) > 0
+                ):
+                    # We are stuck - cyclic dependencies
+                    # We can try to force one to start
+                    await self.start_running(self.pick_waiter())
 
-                if len(self.running) == 0 and len(self.waiting) == 0:
+                if self.running() == 0 and len(self.waiting) == 0:
                     return 0
 
-                logger.debug(f"Waiting for one of {len(self.running)} actions.")
+                logger.debug(f"Waiting for one of {len(self.started)} actions.")
                 done, pending = await asyncio.wait(
-                    [t for t in self.running.keys()],
+                    [t for t in self.started.keys()],
                     timeout=10,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
