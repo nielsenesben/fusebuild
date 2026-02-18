@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum
 from errno import *
+from io import TextIOWrapper
 from pathlib import Path
 from stat import *
 from threading import Lock, Thread
@@ -74,6 +76,7 @@ from fusebuild.core.file_layout import (
     new_access_log_file,
     output_folder_root,
     output_folder_root_str,
+    socket_path,
     status_file,
     status_lock_file,
     stderr_file,
@@ -84,7 +87,7 @@ from fusebuild.core.file_layout import (
 
 from .action_invoker import ActionInvoker, WaitingFor
 from .fuse_mount import BasicMount, unmount
-from .utils import check_pid, kill_subprocess, os_environ, run_action
+from .utils import check_pid, escape_whitespace, kill_subprocess, os_environ, run_action
 
 logger = logger_module.getLogger(__name__)
 
@@ -93,8 +96,82 @@ logger = logger_module.getLogger(__name__)
 dependencies_ok: dict[ActionLabel, bool] = {}
 
 
+def check_build_target_local(label: ActionLabel) -> bool | None:
+    if label in dependencies_ok:
+        logger.debug(f"{label} was in dependencies_ok")
+        return True
+
+    if has_invocation_dir():
+        if invocation_ok_file(label).exists():
+            logger.debug(f"{label} was present in ok dir.")
+            dependencies_ok[label] = True
+            return True
+
+        if invocation_failed_file(label).exists():
+            logger.debug(f"{label} was already marked as failed.")
+            return False
+
+    return None
+
+
+main_connection_file: None | TextIOWrapper = None
+
+
+def ask_main_to_build(label: ActionLabel, for_label: ActionLabel, hard: bool) -> bool:
+    global main_connection_file
+    if main_connection_file is None:
+        logger.info(f"{socket_path()=}")
+        if socket_path() is None:
+            return False
+        client_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client_socket.connect(str(socket_path()))
+        main_connection_file = client_socket.makefile("rw")
+
+    try:
+        message = (
+            "needs: "
+            + escape_whitespace(str(for_label))
+            + " "
+            + escape_whitespace(str(label))
+            + (" hard" if hard else "")
+        )
+        logger.info(f"Sending '{message}' to main")
+        main_connection_file.write(message + "\n")
+        main_connection_file.flush()
+        answer = main_connection_file.readline()
+        logger.debug(f"Got {answer} from main")
+    except Exception as ex:
+        logger.error(f"Got exception when sending to main: {ex}")
+        main_connection_file = None
+        # Return True makes us try again
+    return True
+
+
+def check_label_is_build(
+    label: ActionLabel, for_label: ActionLabel, hard: bool
+) -> bool | None:
+    while True:
+        known_result = check_build_target_local(label)
+        logger.debug(f"Is {label} build? {known_result}")
+        match known_result:
+            case True:
+                return True
+            case False:
+                return False
+            case None:
+                if not ask_main_to_build(label, for_label, hard):
+                    # If we can't for some reason ask main to build it continue below
+                    logger.warning(f"Can't ask main about {label}")
+                    break
+            case _:
+                logger.error("Got {known_result=}")
+                assert False
+
+    return None
+
+
 def check_build_target(
-    src_dir: Path, invoker: ActionInvoker
+    src_dir: Path, invoker: ActionInvoker, hard: bool
 ) -> tuple[bool, ActionLabel | None]:
     src_dir = src_dir.absolute()
     while True:
@@ -110,20 +187,17 @@ def check_build_target(
             return True, None
 
     label = ActionLabel(src_dir.resolve(), target)
-
-    if label in dependencies_ok:
-        logger.debug(f"{label} was in dependencies_ok")
-        return True, label
-
-    if has_invocation_dir():
-        if invocation_ok_file(label).exists():
-            logger.debug(f"{label} was present in ok dir.")
-            dependencies_ok[label] = True
+    invoker_label = invoker.get_label()
+    assert invoker_label is not None
+    match check_label_is_build(label, invoker_label, hard):
+        case True:
             return True, label
-
-        if invocation_failed_file(label).exists():
-            logger.debug(f"{label} was already marked as failed.")
+        case False:
             return False, label
+        case None:
+            pass
+
+    logger.warning(f"{label} is not build - figuring it out here.")
 
     action = get_action(src_dir, target, invoker)
     match action:
@@ -175,6 +249,9 @@ class ExecuterBase(ActionInvoker):
     @property
     def name(self) -> str:
         return self.label.name
+
+    def get_label(self) -> ActionLabel:
+        return self.label
 
     def runtarget_args(self) -> list[str]:
         return [str(self.label.path), self.label.name]
@@ -281,6 +358,7 @@ class BasicExecuter(ExecuterBase):
                 else invocation_failed_file(self.label)
             )
             done_file.parent.mkdir(parents=True, exist_ok=True)
+            logger.debug(f"Writing donefile {done_file}")
             with done_file.open("w") as f:
                 f.write(f"{retcode}\n")
 
@@ -626,7 +704,11 @@ class BasicExecuter(ExecuterBase):
                 print(f"{self.directory} / {self.name}: Action changed")
                 matches = False
             else:
-                matches = check_accesses(self.label, check_build_target, self)
+                matches = check_accesses(
+                    self.label,
+                    lambda path, invoker: check_build_target(path, invoker, False),
+                    self,
+                )
 
         if action_setup_record_old is None:
             return Ok(True)
@@ -785,6 +867,7 @@ def load_actions(path: Path) -> dict[ActionLabel, Action]:
     ).absolute()
     actions = {}
     for action_file in actions_path.glob("*.json"):
+        logger.debug(f"Found actionfile {action_file}")
         name = action_file.name.removesuffix(".json")
         label = ActionLabel(path, name)
         action = load_action_file(label, action_file)
@@ -796,14 +879,28 @@ def load_actions(path: Path) -> dict[ActionLabel, Action]:
 
 
 def check_build_file(
-    buildfile: Path, invoker: ActionInvoker, reason: str
+    buildfile: Path, invoker: ActionInvoker, looking_for: ActionLabel
 ) -> Result[dict[ActionLabel, Action], int | None]:
     logger.debug(f"check_build_file({buildfile})")
     buildfile = buildfile.absolute()
+
     if not buildfile.exists():
         return Err(None)
+
+    label = ActionLabel(buildfile.parent, buildfile.name)
+    for_label = invoker.get_label()
+    if for_label is None:
+        for_label = looking_for
+    match check_label_is_build(label, for_label, False):
+        case True:
+            return Ok(load_actions(buildfile.parent))
+        case False:
+            return Err(1)
+        case None:
+            pass
+
     executer = LoadBuildFileExecuter(buildfile)
-    ret = executer.run_if_needed(invoker, reason)
+    ret = executer.run_if_needed(invoker, str(looking_for))
     logger.debug(f"run_if_needed for {buildfile}: {ret}")
     if ret is not None:
         executer.release_lock()
@@ -833,7 +930,7 @@ def get_action(
         # SBUILD file load and actions are up-to-date, but no such action
         return None
 
-    res = check_build_file(path / "FUSEBUILD.py", invoker, str(label))
+    res = check_build_file(path / "FUSEBUILD.py", invoker, label)
     match res:
         case Err(ret):
             logger.warning(f"Failed to load {path / 'FUSEBUILD.py'}: Returned {ret}")
@@ -848,23 +945,35 @@ def get_action(
     return loaded_actions[label]
 
 
+noaction = Action(cmd=[], category="nonexistring")
+
+
+class NonExistingActionExecuter(BasicExecuter):
+    def __init__(self, label: ActionLabel):
+        super(NonExistingActionExecuter, self).__init__(label, noaction)
+
+    def run_if_needed(self, invoker: ActionInvoker, reason: str) -> int:
+        self.mark_as_done(0)
+        return 0
+
+
 def get_action_executer(
     p: Path, name: str, invoker: ActionInvoker
-) -> BasicExecuter | None:
+) -> BasicExecuter | int:
     if name == "FUSEBUILD.py":
         return LoadBuildFileExecuter(p / name)
 
+    p = p.resolve()
+    if p.is_file():
+        p = p.parent
     action = get_action(p, name, invoker)
     logger.debug(f"get_action_executer({p}, {name}) = {action}")
     match action:
         case None:
-            return None
+            return NonExistingActionExecuter(ActionLabel(p, name))
         case int(res):
-            return None
+            return res
         case _:
-            p = p.resolve()
-            if p.is_file():
-                p = p.parent
             return ActionExecuter(ActionLabel(p, name), action)
 
 

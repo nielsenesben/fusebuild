@@ -4,6 +4,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 import psutil
 
@@ -86,3 +87,19 @@ def run_action(directory: Path, target: str, invoker: ActionInvoker) -> int:
             kill_subprocess(process)
         raise
     return res
+
+
+from urllib.parse import quote, unquote
+
+
+def escape_whitespace(text: str) -> str:
+    """Replaces all space and non-ASCII characters with %hexcode as in URLs"""
+    return quote(
+        text,
+        safe="!\"#$&'()*+,-./:;<=>?@[\\]^_`{|}~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    )
+
+
+def unescape_whitespace(text: str) -> str:
+    """Reverses the above"""
+    return unquote(text)

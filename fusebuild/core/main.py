@@ -16,7 +16,7 @@ from enum import Enum
 from multiprocessing import cpu_count
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Protocol
 
 import filelock
 import psutil
@@ -28,6 +28,7 @@ from .action_invoker import ActionInvoker, DummyInvoker
 from .file_layout import (
     FUSEBUILD_INVOCATION_DIR,
     action_dir,
+    socket_path,
     status_lock_file,
     stderr_file,
     stdout_file,
@@ -42,7 +43,7 @@ from .libfusebuild import (
     load_actions,
 )
 from .logger import FUSEBUILD_LOG_LEVEL, getLogger
-from .utils import run_action_cmd_env
+from .utils import run_action_cmd_env, unescape_whitespace
 
 logger = getLogger(__name__)
 
@@ -121,6 +122,7 @@ class BuildActionStatus(Enum):
 # RUNABLE -> RUNNING when start runnning
 # RUNNING -> BLOCKED when unknown deps are found while running
 # BLOCKED -> BLOCKED_RUNABLE when blocker have finished
+# BLOCKED_RUNABLE -> RUNNING when it is scheduled to continue
 # RUNNING -> SUCCESSFULL when done with return code 0
 # RUNNING -> FAILED when done with return code non-zero 0
 
@@ -147,12 +149,14 @@ class BuildAction:
     needed: bool
     status: BuildActionStatus = BuildActionStatus.WAITING
     deps: set[ActionLabel] = field(default_factory=set)
+    hard_deps: set[ActionLabel] = field(default_factory=set)
     dependers: set[ActionLabel] = field(default_factory=set)
-    done_actions: set[Callable[[], None]] = field(default_factory=set)
+    done_actions: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
+    connections: set[asyncio.StreamWriter] = field(default_factory=set)
 
 
 class ActionExecuter(Protocol):
-    def schedule_action(self, action: BuildAction) -> None:
+    async def schedule_action(self, action: BuildAction) -> None:
         """Execute action if it matches category"""
         ...
 
@@ -181,19 +185,25 @@ class ActionExecuterImpl(ActionExecuter):
         self.max_running = max_running
         self.invoker = DummyInvoker()
         self.invocation_dir = invocation_dir
-        self.open_connections: list[asyncio.StreamWriter] = []
+        self.open_connections: set[asyncio.StreamWriter] = set([])
         self.connection_reader_tasks: set[asyncio.Task[Any]] = set()
+        self.pending: list[BuildAction] = []
+        self.wakeup: asyncio.Queue[None] = asyncio.Queue()
 
     def _update_dependers(self, action: BuildAction) -> None:
         for d in action.deps:
             self.actions[d].dependers.add(action.label)
 
-    def _waiting_or_runable(self, action: BuildAction) -> None:
+    async def _waiting_or_runable(self, action: BuildAction) -> None:
         if waiting_status(action.status) or runable_status(action.status):
             undone_dep = False
             for d in action.deps:
+                logger.debug(
+                    f"{action.label} depends on {d} with status {self.actions[d].status}"
+                )
                 if not finished_status(self.actions[d].status):
-                    undone_deps = True
+                    logger.debug(f"{action.label} must wait for {d} to finish.")
+                    undone_dep = True
                     break
 
             match action.status:
@@ -216,14 +226,19 @@ class ActionExecuterImpl(ActionExecuter):
                         action.status = BuildActionStatus.RUNABLE
                         self.runable.add(action.label)
                         self.waiting.discard(action.label)
-
                 case _:
                     assert False
+
+        await self.wakeup.put(None)
+        logger.info(f"{action.label} is now in status {action.status}")
 
     def running(self) -> int:
         return len(self.started) - len(self.blocked) - len(self.blocked_runable)
 
-    def schedule_action(self, action: BuildAction) -> None:
+    def schedule_action_nonasync(self, action: BuildAction) -> None:
+        self.pending.append(action)
+
+    async def schedule_action(self, action: BuildAction) -> None:
         self.need_resort = True
         logger.debug(f"Scheduling {action.label}")
         if action.label in self.actions:
@@ -233,7 +248,7 @@ class ActionExecuterImpl(ActionExecuter):
             old_action.needed = old_action.needed or action.needed
             # old_action dependenders already done, only new ones
             self._update_dependers(action)
-            self._waiting_or_runable(old_action)
+            await self._waiting_or_runable(old_action)
         else:
             self.actions[action.label] = action
             self.waiting.add(action.label)
@@ -241,17 +256,19 @@ class ActionExecuterImpl(ActionExecuter):
                 logger.debug(f"Adding dependency {d} for {action.label}")
                 action.deps.add(d)
                 if d not in self.actions:
-                    self.schedule_action(BuildAction(d, needed=False))
+                    await self.schedule_action(BuildAction(d, needed=False))
             if action.label.name != "FUSEBUILD.py":
                 bf_label = ActionLabel(action.label.path, "FUSEBUILD.py")
                 logger.debug(f"Adding {bf_label} for {action.label}")
 
                 action.deps.add(bf_label)
+                action.hard_deps.add(bf_label)
                 if bf_label not in self.actions:
-                    self.schedule_action(BuildAction(bf_label, needed=True))
+                    await self.schedule_action(BuildAction(bf_label, needed=True))
+                self._update_dependers(action)
 
             self._update_dependers(action)
-            self._waiting_or_runable(action)
+            await self._waiting_or_runable(action)
 
     async def start_running(self, action: BuildAction) -> None:
         logger.debug(f"Starting {action.label}")
@@ -268,23 +285,44 @@ class ActionExecuterImpl(ActionExecuter):
         task = asyncio.create_task(proc.wait())
         self.started[task] = (proc, action)
 
-    def action_done(self, task: asyncio.Task[Any]) -> None:
+    async def action_done(self, task: asyncio.Task[Any]) -> None:
         assert task in self.started
+
         process, action = self.started.pop(task)
         logger.debug(f"{action.label}: {process.returncode}")
         if process.returncode == 0:
             action.status = BuildActionStatus.SUCCESSFULL
             print(f"{action.label} ... Ok")
             for done_cb in action.done_actions:
-                done_cb()
+                await done_cb()
         else:
             print(f"{action.label} ... Failed")
             action.status = BuildActionStatus.FAILED
             if action.needed:
                 self.failures.append(action)
 
+        logger.info(f"{action.label} is now in status {action.status}")
         for d in action.dependers:
-            self._waiting_or_runable(self.actions[d])
+            await self._waiting_or_runable(self.actions[d])
+
+    def _check_for_deadlock_inner(
+        self, at: ActionLabel, seen: list[ActionLabel]
+    ) -> bool:
+        if at in seen:
+            print(f"Deadlock: {at} ->", file=sys.stderr)
+            for p in seen[::-1]:
+                print(f"   {p} ->", file=sys.stderr)
+            return True
+
+        seen_now = seen + [at]
+        for hd in self.actions[at].hard_deps:
+            if self._check_for_deadlock_inner(hd, seen_now):
+                return True
+
+        return False
+
+    def _check_for_deadlock(self, start: ActionLabel) -> bool:
+        return self._check_for_deadlock_inner(start, [])
 
     async def _read_from_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -293,36 +331,78 @@ class ActionExecuterImpl(ActionExecuter):
         logger.info(f"Start reading from {peername}")
         try:
             while not reader.at_eof():
-                line = await reader.readline()
-                if not line:
+                logger.debug(f"Before reading from {peername}")
+                line_bytes = await reader.readline()
+                logger.debug(f"After reading from {peername}: {line_bytes=}")
+
+                if not line_bytes:
                     break
-                logger.info(f"Received from {peername}: {line.decode().strip()}")
+                line: str = line_bytes.decode().rstrip()
+                logger.debug(f"Received from {peername}: {line}")
+                split = line.split(" ")
+                if split[0] == "needs:":
+                    invoker_label = label_from_line(unescape_whitespace(split[1]))
+                    to_build = label_from_line(unescape_whitespace(split[2]))
+                    hard = len(split) > 3 and split[3] == "hard"
+                    invoking_action = self.actions[invoker_label]
+                    await self.schedule_action(
+                        BuildAction(to_build, invoking_action.needed)
+                    )
+                    invoking_action.deps.add(to_build)
+                    self._update_dependers(invoking_action)
+
+                    invoking_action.connections.add(writer)
+                    invoking_action.status = BuildActionStatus.BLOCKED
+                    self.blocked.add(invoking_action.label)
+
+                    if hard:
+                        invoking_action.hard_deps.add(to_build)
+                        if self._check_for_deadlock(invoking_action.label):
+                            invoking_action.status = BuildActionStatus.FAILED
+                            self.failures.append(invoking_action)
+
+                    await self._waiting_or_runable(invoking_action)
+                else:
+                    logger.error("Got unknwown command on internal socket:" + line)
         except asyncio.CancelledError:
             logger.info(f"Reader task for {peername} cancelled.")
-            raise
-        except Exception as e:
-            logger.error(f"Error reading from {peername}: {e}")
+        except ConnectionResetError:
+            logger.info(f"Reader task for {peername} closed.")
+        except BrokenPipeError:
+            logger.info(f"Reader task for {peername} closed (broken pipe).")
+        except Exception as ex:
+            logger.error("An error occurred", exc_info=True)
+            logger.error(f"Error reading from {peername}: {type(ex)}")
         finally:
             logger.info(f"Closing connection from {peername}")
-            if writer in self.open_connections:
-                self.open_connections.remove(writer)
+            self.open_connections.discard(writer)
             writer.close()
             await writer.wait_closed()
+
+    def remove_connection_reader_task(self, task: asyncio.Task[Any]) -> None:
+        logger.debug("Removing connection")
+        self.connection_reader_tasks.discard(task)
 
     async def handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         peername = writer.get_extra_info("peername")
         logger.info(f"Received connection from {peername}")
-        self.open_connections.append(writer)
+        self.open_connections.add(writer)
 
         task = asyncio.create_task(self._read_from_connection(reader, writer))
         self.connection_reader_tasks.add(task)
-        task.add_done_callback(self.connection_reader_tasks.discard)
+        logger.debug(
+            f"Now there are {len(self.connection_reader_tasks)}/{len(self.open_connections)} connections"
+        )
+        task.add_done_callback(self.remove_connection_reader_task)
 
     async def unblock(self, action: BuildAction) -> None:
-        # TODO
-        assert False
+        assert len(action.connections) > 0
+        for c in action.connections:
+            logger.debug(f"Sending 'try again' to {action.label}")
+            c.write(b"try again\n")
+        self.blocked_runable.remove(action.label)
 
     def pick_waiter(self) -> BuildAction:
         return self.pick_one(self.waiting)
@@ -347,12 +427,15 @@ class ActionExecuterImpl(ActionExecuter):
         return best
 
     async def run(self) -> int:
-        socket_path = self.invocation_dir / "fusebuild.sock"
+        s_path = socket_path()
+        assert s_path is not None
         server = await asyncio.start_unix_server(
-            self.handle_connection, path=str(socket_path)
+            self.handle_connection, path=str(s_path)
         )
         logger.info(f"Listening on unix socket {socket_path}")
-
+        for action in self.pending:
+            await self.schedule_action(action)
+        self.pending = []
         try:
             while True:
                 if len(self.failures) > 0:
@@ -360,6 +443,9 @@ class ActionExecuterImpl(ActionExecuter):
                     print_failure(failure.label, set([]))
                     return 1
 
+                logger.debug(
+                    f"{len(self.waiting)=} {len(self.runable)=} {len(self.started)=} {len(self.blocked)=}  {len(self.blocked_runable)=}"
+                )
                 while self.running() < self.max_running:
                     if len(self.blocked_runable) > 0:
                         await self.unblock(self.pick_one(self.blocked_runable))
@@ -375,14 +461,26 @@ class ActionExecuterImpl(ActionExecuter):
                 ):
                     # We are stuck - cyclic dependencies
                     # We can try to force one to start
-                    await self.start_running(self.pick_waiter())
+                    to_run = self.pick_waiter()
+                    logger.warning(f"Might be in deadlock. Try running {to_run.label}")
+                    await self.start_running(to_run)
 
-                if self.running() == 0 and len(self.waiting) == 0:
+                if (
+                    self.running() == 0
+                    and len(self.waiting) == 0
+                    and len(self.runable) == 0
+                    and len(self.blocked) == 0
+                    and len(self.blocked_runable) == 0
+                ):
                     return 0
 
-                logger.debug(f"Waiting for one of {len(self.started)} actions.")
+                logger.debug(
+                    f"Waiting for one of {len(self.started)} started actions and {len(self.connection_reader_tasks)}/{len(self.open_connections)} connections"
+                )
+                wakeup_task = asyncio.create_task(self.wakeup.get())
+
                 done, pending = await asyncio.wait(
-                    [t for t in self.started.keys()],
+                    [t for t in self.started.keys()] + [wakeup_task],
                     timeout=10,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -391,12 +489,16 @@ class ActionExecuterImpl(ActionExecuter):
                     continue
 
                 for d in done:
-                    self.action_done(d)
+                    logger.debug(f"Done d={d}")
+                    if d == wakeup_task:
+                        continue
+                    await self.action_done(d)
         finally:
             logger.info("Closing unix socket")
             server.close()
             await server.wait_closed()
-            socket_path.unlink(missing_ok=True)
+
+            s_path.unlink(missing_ok=True)
 
             if self.connection_reader_tasks:
                 logger.info(
@@ -420,12 +522,12 @@ class ScheduleAll:
     bf_label: ActionLabel
     categories: frozenset[str]
 
-    def __call__(self) -> None:
+    async def __call__(self) -> None:
         actions = load_actions(self.bf_label.path)
         print(f"Loading all actions {self.bf_label}")
         for label, action in actions.items():
             if action.category in self.categories:
-                self.executer.schedule_action(BuildAction(label, needed=True))
+                await self.executer.schedule_action(BuildAction(label, needed=True))
 
 
 def main_inner(args: list[str]) -> int:
@@ -457,6 +559,7 @@ def main_inner(args: list[str]) -> int:
     executer = ActionExecuterImpl(
         max_running=max_running, invocation_dir=invocation_dir
     )
+
     for ti in arg.target:
         t: Path = ti.absolute()
         logger.debug(f"Processing {ti} at {os.getcwd()=}: {t=}")
@@ -472,7 +575,7 @@ def main_inner(args: list[str]) -> int:
                     needed=True,
                     done_actions={ScheduleAll(executer, bf_label, categories)},
                 )
-                executer.schedule_action(action)
+                executer.schedule_action_nonasync(action)
 
         else:
             while True:
@@ -485,7 +588,7 @@ def main_inner(args: list[str]) -> int:
                 logger.debug(f"{t=} {name=}")
                 build_file = t / "FUSEBUILD.py"
                 if build_file.exists():
-                    executer.schedule_action(
+                    executer.schedule_action_nonasync(
                         BuildAction(ActionLabel(t, name), needed=True)
                     )
                     break

@@ -19,6 +19,7 @@ class WaitingFor(Protocol):
 class ActionInvoker(Protocol):
     def waiting_for(self, label: ActionLabel) -> AbstractContextManager[WaitingFor]: ...
 
+    def get_label(self) -> ActionLabel | None: ...
     def runtarget_args(self) -> list[str]: ...
 
 
@@ -37,6 +38,9 @@ class DummyInvoker(ActionInvoker):
                 pass
 
         return WaitingForImpl()
+
+    def get_label(self) -> ActionLabel | None:
+        return None
 
     def runtarget_args(self) -> list[str]:
         return []

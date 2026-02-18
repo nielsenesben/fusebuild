@@ -122,3 +122,11 @@ def invocation_failed_file(label: ActionLabel) -> Path:
         / str(label.path).lstrip("/")
         / label.name
     )
+
+
+def socket_path() -> Path | None:
+    """Path to the unix socket used to mark a task as blocked"""
+    if not has_invocation_dir():
+        return None
+
+    return Path(os.environ[FUSEBUILD_INVOCATION_DIR]) / "fusebuild.sock"
