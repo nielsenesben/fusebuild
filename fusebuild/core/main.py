@@ -377,7 +377,12 @@ class ActionExecuterImpl(ActionExecuter):
             logger.info(f"Closing connection from {peername}")
             self.open_connections.discard(writer)
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionResetError:
+                pass
+            except BrokenPipeError:
+                pass
 
     def remove_connection_reader_task(self, task: asyncio.Task[Any]) -> None:
         logger.debug("Removing connection")
