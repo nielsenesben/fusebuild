@@ -17,7 +17,7 @@ logger = getLogger(__name__)
 def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | None:
     # os.setpgrp()
     logger.debug(f"Runtarget {buildfile=} {target=} {invoker=}")
-    assert buildfile.is_file()
+    #assert buildfile.is_file()
     executer = get_action_executer(buildfile.parent, target, invoker)
     if executer is None:
         return -1
