@@ -83,7 +83,7 @@ def write_actions() -> Any:
 
 
 def get_action(path: Path | str, name: str) -> Action:
-    path = Path(path).absolute()
+    path = Path(path).resolve()
     label = ActionLabel(path, name)
     if label in loaded_actions:
         return loaded_actions[label]

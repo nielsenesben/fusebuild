@@ -1,4 +1,4 @@
-from fusebuild import BwrapSandbox, NoSandbox, get_action, shell_action
+from fusebuild import BwrapSandbox, NoSandbox, RandomTmpDir, get_action, shell_action
 from fusebuild.python import mypy_actions, pyc_actions, pyc_mappings
 
 pyc_actions()
@@ -17,20 +17,6 @@ shell_action(
     mappings=pyc_mappings(),
 )
 
-shell_action(
-    name="test_graph",
-    cmd="\n".join(
-        [
-            ". $OUTPUT_DIR/../../venv/bin/activate",
-            "export FUSEBUILD_CACHE_DIR=$OUTPUT_DIR/fusebuild_cache",
-            "ls -altr",
-            "python -B test_graph.py",
-            "ls -altr",
-        ]
-    ),
-    category="test",
-    mappings=pyc_mappings(),
-)
 
 shell_action(
     name="test_action",
@@ -84,6 +70,7 @@ shell_action(
     ),
     category="test",
     sandbox=BwrapSandbox(run_as_root=True),
+    tmp=RandomTmpDir(),
     mappings=pyc_mappings(),
 )
 

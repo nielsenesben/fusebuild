@@ -83,9 +83,8 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
                 return
             if status.status != StatusEnum.DONE:
                 print(
-                    f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed"
+                    f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed reliable"
                 )
-                return
             subbuild_failed_path = subbuild_failed_file(label)
             if subbuild_failed_path.exists():
                 seen2 = seen.union({label})
