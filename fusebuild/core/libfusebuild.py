@@ -431,7 +431,8 @@ class BasicExecuter(ExecuterBase):
                         logger.debug("Timeput while waiting for build process to stop")
                         assert self.fuse_mount is not None
                         if count > 60:
-                            kill_subprocess(self.fuse_mount)
+                            assert self.build_process is not None
+                            kill_subprocess(self.build_process)
                     except Exception as e:
                         logger.error(f"Error while waiting for fuse mount to stop: {e}")
 
