@@ -407,6 +407,7 @@ class ActionExecuterImpl(ActionExecuter):
             logger.debug(f"Sending 'try again' to {action.label}")
             c.write(b"try again\n")
         self.blocked_runable.remove(action.label)
+        self.status = BuildActionStatus.RUNNING
 
     def pick_waiter(self) -> BuildAction:
         return self.pick_one(self.waiting)
