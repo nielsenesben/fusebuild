@@ -440,12 +440,27 @@ class ActionExecuterImpl(ActionExecuter):
         for action in self.pending:
             await self.schedule_action(action)
         self.pending = []
+        next_print = time.monotonic()
         try:
             while True:
                 if len(self.failures) > 0:
                     failure = self.failures[0]
                     print_failure(failure.label, set([]))
                     return 1
+                now = time.monotonic()
+                if now > next_print:
+                    next_print += 1
+                    for a in self.waiting:
+                        print(f"{a} waiting")
+                    for a in self.runable:
+                        print(f"{a} runable")
+                    for a in self.blocked:
+                        print(f"{a} blocked")
+                    for a in self.blocked_runable:
+                        print(f"{a} blocked runable")
+                    for _, action in self.started.values():
+                        if action.status == BuildActionStatus.RUNNING:
+                            print(f"{action.label} running")
 
                 logger.debug(
                     f"{len(self.waiting)=} {len(self.runable)=} {len(self.started)=} {len(self.blocked)=}  {len(self.blocked_runable)=}"
@@ -485,7 +500,7 @@ class ActionExecuterImpl(ActionExecuter):
 
                 done, pending = await asyncio.wait(
                     [t for t in self.started.keys()] + [wakeup_task],
-                    timeout=10,
+                    timeout=1,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if len(done) == 0:
