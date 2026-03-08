@@ -517,7 +517,7 @@ class ActionExecuterImpl(ActionExecuter):
             logger.info("Closing unix socket")
             server.close()
             await server.wait_closed()
-
+            logger.info("Unix socker closed")
             s_path.unlink(missing_ok=True)
 
             if self.connection_reader_tasks:
@@ -528,12 +528,14 @@ class ActionExecuterImpl(ActionExecuter):
                 for task in tasks:
                     task.cancel()
 
+                logger.info("Gather {len(tasks)} connection reader tasks")
                 await asyncio.gather(*tasks, return_exceptions=True)
 
             if self.open_connections:
                 logger.warning(
                     f"{len(self.open_connections)} connections were not cleaned up properly."
                 )
+            logger.info("Done closing connections")
 
 
 @dataclass(frozen=True)

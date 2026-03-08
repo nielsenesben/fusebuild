@@ -39,7 +39,8 @@ class TestCircular(TestCase):
                 "fusebuild",
                 "circular",
                 str(self.workdir / "A"),
-            ]
+            ],
+            timeout=60,
         )
         self.assertEqual(ret.returncode, 1)
 
@@ -78,7 +79,8 @@ shell_action(
                 "fusebuild",
                 "circular",
                 str(self.workdir / "A"),
-            ]
+            ],
+            timeout=60,
         )
         self.assertEqual(ret.returncode, 0)
 
@@ -95,7 +97,8 @@ shell_action(
                 "fusebuild",
                 "circular",
                 str(self.workdir / "A"),
-            ]
+            ],
+            timeout=60,
         )
         self.assertEqual(ret.returncode, 1)
 
@@ -107,7 +110,8 @@ shell_action(
                 "fusebuild",
                 "circular",
                 str(self.workdir / "D"),
-            ]
+            ],
+            timeout=60,
         )
         self.assertEqual(ret.returncode, 1)
 
@@ -151,7 +155,8 @@ get_action("../subA", "A")
                 "fusebuild",
                 "build",
                 str(self.workdir),
-            ]
+            ],
+            timeout=60,
         )
         self.assertEqual(ret.returncode, 1)
 
