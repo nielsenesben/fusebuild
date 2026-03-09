@@ -515,9 +515,11 @@ class ActionExecuterImpl(ActionExecuter):
                     await self.action_done(d)
         finally:
             logger.info("Closing unix socket")
+            for client in self.open_connections:
+                client.close()
             server.close()
             await server.wait_closed()
-            logger.info("Unix socker closed")
+            logger.info("Unix socket closed")
             s_path.unlink(missing_ok=True)
 
             if self.connection_reader_tasks:

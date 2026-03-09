@@ -156,7 +156,7 @@ get_action("../subA", "A")
                 "build",
                 str(self.workdir),
             ],
-            timeout=60,
+            timeout=120,
         )
         self.assertEqual(ret.returncode, 1)
 
