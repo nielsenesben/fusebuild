@@ -19,12 +19,15 @@ def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | No
     logger.debug(f"Runtarget {buildfile=} {target=} {invoker=}")
     assert buildfile.is_file()
     executer = get_action_executer(buildfile.parent, target, invoker)
-    if executer is None:
-        return -1
-    return_code = executer.run_if_needed(
-        invoker, f"building {[str(a) for a in invoker.runtarget_args()]}"
-    )
-    return return_code
+    match executer:
+        case int(x):
+            # Some error code
+            return executer
+        case BasicExecuter:
+            return_code = executer.run_if_needed(
+                invoker, f"building {[str(a) for a in invoker.runtarget_args()]}"
+            )
+            return return_code
 
 
 if __name__ == "__main__":

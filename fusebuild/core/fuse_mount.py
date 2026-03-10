@@ -114,7 +114,7 @@ class BasicMount(Fuse):  # type: ignore
             self.access_recorder.record_dir_exists(src_dir, True)
         else:
             self.access_recorder.record_dir_exists(src_dir, False)
-            success, label = check_build_target(src_dir, self.invoker)
+            success, label = check_build_target(src_dir, self.invoker, True)
             if label is not None:
                 self.access_recorder.action_deps.add(label)
             if not success:

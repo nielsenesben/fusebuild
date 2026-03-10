@@ -16,7 +16,7 @@ from enum import Enum
 from multiprocessing import cpu_count
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Protocol
 
 import filelock
 import psutil
@@ -28,12 +28,12 @@ from .action_invoker import ActionInvoker, DummyInvoker
 from .file_layout import (
     FUSEBUILD_INVOCATION_DIR,
     action_dir,
+    socket_path,
     status_lock_file,
     stderr_file,
     stdout_file,
     subbuild_failed_file,
 )
-from .graph import sort_graph
 from .libfusebuild import (
     BasicExecuter,
     ExecuterBase,
@@ -43,7 +43,7 @@ from .libfusebuild import (
     load_actions,
 )
 from .logger import FUSEBUILD_LOG_LEVEL, getLogger
-from .utils import run_action_cmd_env
+from .utils import run_action_cmd_env, unescape_whitespace
 
 logger = getLogger(__name__)
 
@@ -83,9 +83,8 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
                 return
             if status.status != StatusEnum.DONE:
                 print(
-                    f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed"
+                    f"Some other is building {label} (pid={status.running_pid}) such that failure can't be printed reliable"
                 )
-                return
             subbuild_failed_path = subbuild_failed_file(label)
             if subbuild_failed_path.exists():
                 seen2 = seen.union({label})
@@ -108,46 +107,138 @@ def print_failure(label: ActionLabel, seen: set[ActionLabel]) -> None:
 
 
 class BuildActionStatus(Enum):
-    IN_QUEUE = 0
-    RUNNING = 1
-    SUCCESSFULL = 2
-    FAILED = 3
+    WAITING = 0
+    RUNABLE = 1
+    RUNNING = 2
+    BLOCKED = 3
+    BLOCKED_RUNABLE = 4
+    SUCCESSFULL = 5
+    FAILED = 6
+
+
+# Possible transitions:
+# WAITING -> RUNABLE when all deps are done
+# RUNABLE -> RUNNING when start runnning
+# RUNNING -> BLOCKED when unknown deps are found while running
+# BLOCKED -> BLOCKED_RUNABLE when blocker have finished
+# BLOCKED_RUNABLE -> RUNNING when it is scheduled to continue
+# RUNNING -> SUCCESSFULL when done with return code 0
+# RUNNING -> FAILED when done with return code non-zero 0
+
+
+def waiting_status(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.WAITING or s == BuildActionStatus.BLOCKED
+
+
+def have_not_started(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.WAITING or s == BuildActionStatus.RUNABLE
+
+
+def runable_status(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.RUNABLE or s == BuildActionStatus.BLOCKED_RUNABLE
+
+
+def finished_status(s: BuildActionStatus) -> bool:
+    return s == BuildActionStatus.SUCCESSFULL or s == BuildActionStatus.FAILED
 
 
 @dataclass
 class BuildAction:
     label: ActionLabel
     needed: bool
-    status: BuildActionStatus = BuildActionStatus.IN_QUEUE
+    status: BuildActionStatus = BuildActionStatus.WAITING
     deps: set[ActionLabel] = field(default_factory=set)
-    done_actions: set[Callable[[], None]] = field(default_factory=set)
+    hard_deps: set[ActionLabel] = field(default_factory=set)
+    dependers: set[ActionLabel] = field(default_factory=set)
+    done_actions: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
+    connections: set[asyncio.StreamWriter] = field(default_factory=set)
 
 
 class ActionExecuter(Protocol):
-    def schedule_action(self, action: BuildAction) -> None:
+    async def schedule_action(self, action: BuildAction) -> None:
         """Execute action if it matches category"""
         ...
 
 
 class ActionExecuterImpl(ActionExecuter):
     actions: dict[ActionLabel, BuildAction]
-    running: dict[asyncio.Task[Any], tuple[asyncio.subprocess.Process, BuildAction]]
-    waiting: list[BuildAction]
-    need_resort: bool
+    waiting: set[ActionLabel]
+    runable: set[ActionLabel]
+    started: dict[asyncio.Task[Any], tuple[asyncio.subprocess.Process, BuildAction]]
+    blocked: set[ActionLabel]
+    blocked_runable: set[ActionLabel]
     failures: list[BuildAction]
     max_running: int
     invoker: ActionInvoker
+    invocation_dir: Path
 
-    def __init__(self, max_running: int) -> None:
+    def __init__(self, max_running: int, invocation_dir: Path) -> None:
         self.actions = {}
-        self.running = {}
-        self.waiting = []
+        self.waiting = set([])
+        self.runable = set([])
+        self.started = {}
+        self.blocked = set([])
+        self.blocked_runable = set([])
         self.need_resort = False
         self.failures = []
+        self.deadlock_detected = False
         self.max_running = max_running
         self.invoker = DummyInvoker()
+        self.invocation_dir = invocation_dir
+        self.open_connections: set[asyncio.StreamWriter] = set([])
+        self.connection_reader_tasks: set[asyncio.Task[Any]] = set()
+        self.pending: list[BuildAction] = []
+        self.wakeup: asyncio.Queue[None] = asyncio.Queue()
 
-    def schedule_action(self, action: BuildAction) -> None:
+    def _update_dependers(self, action: BuildAction) -> None:
+        for d in action.deps:
+            self.actions[d].dependers.add(action.label)
+
+    async def _waiting_or_runable(self, action: BuildAction) -> None:
+        if waiting_status(action.status) or runable_status(action.status):
+            undone_dep = False
+            for d in action.deps:
+                logger.debug(
+                    f"{action.label} depends on {d} with status {self.actions[d].status}"
+                )
+                if not finished_status(self.actions[d].status):
+                    logger.debug(f"{action.label} must wait for {d} to finish.")
+                    undone_dep = True
+                    break
+
+            match action.status:
+                case BuildActionStatus.BLOCKED | BuildActionStatus.BLOCKED_RUNABLE:
+                    if undone_dep:
+                        action.status = BuildActionStatus.BLOCKED
+                        self.blocked.add(action.label)
+                        self.blocked_runable.discard(action.label)
+                    else:
+                        action.status = BuildActionStatus.BLOCKED_RUNABLE
+                        self.blocked_runable.add(action.label)
+                        self.blocked.discard(action.label)
+
+                case BuildActionStatus.WAITING | BuildActionStatus.RUNABLE:
+                    if undone_dep:
+                        action.status = BuildActionStatus.WAITING
+                        self.waiting.add(action.label)
+                        self.runable.discard(action.label)
+                    else:
+                        action.status = BuildActionStatus.RUNABLE
+                        self.runable.add(action.label)
+                        self.waiting.discard(action.label)
+                case _:
+                    assert False
+
+        await self.wakeup.put(None)
+        logger.info(f"{action.label} is now in status {action.status}")
+
+    def running(self) -> int:
+        return len(self.started) - len(self.blocked) - len(self.blocked_runable)
+
+    def schedule_action_nonasync(self, action: BuildAction) -> None:
+        self.pending.append(action)
+
+    async def schedule_action(self, action: BuildAction) -> None:
         self.need_resort = True
         logger.debug(f"Scheduling {action.label}")
         if action.label in self.actions:
@@ -155,64 +246,36 @@ class ActionExecuterImpl(ActionExecuter):
             old_action.deps.update(action.deps)
             old_action.done_actions.update(action.done_actions)
             old_action.needed = old_action.needed or action.needed
+            # old_action dependenders already done, only new ones
+            self._update_dependers(action)
+            await self._waiting_or_runable(old_action)
         else:
             self.actions[action.label] = action
-            self.waiting.append(action)
+            self.waiting.add(action.label)
             for d in load_action_deps(action.label):
                 logger.debug(f"Adding dependency {d} for {action.label}")
                 action.deps.add(d)
                 if d not in self.actions:
-                    self.schedule_action(BuildAction(d, needed=False))
+                    await self.schedule_action(BuildAction(d, needed=False))
             if action.label.name != "FUSEBUILD.py":
                 bf_label = ActionLabel(action.label.path, "FUSEBUILD.py")
                 logger.debug(f"Adding {bf_label} for {action.label}")
 
                 action.deps.add(bf_label)
+                action.hard_deps.add(bf_label)
                 if bf_label not in self.actions:
-                    self.schedule_action(BuildAction(bf_label, needed=True))
+                    await self.schedule_action(BuildAction(bf_label, needed=True))
+                self._update_dependers(action)
 
-    def sort_waiting(self) -> None:
-        graph: dict[ActionLabel, list[ActionLabel]] = {}
-
-        def members() -> Iterable[BuildAction]:
-            for a in self.waiting:
-                assert a.status == BuildActionStatus.IN_QUEUE
-                yield a
-            for ta in self.running.values():
-                assert ta[1].status == BuildActionStatus.RUNNING
-                yield ta[1]
-
-        for a in members():
-            graph[a.label] = [
-                d
-                for d in a.deps
-                if self.actions[d].status
-                in [BuildActionStatus.IN_QUEUE, BuildActionStatus.RUNNING]
-            ]
-        assert len(graph) == len(self.waiting) + len(self.running)
-        sorted_actions = sort_graph(graph)
-        assert len(sorted_actions) == len(graph)
-        waiting_new = [
-            self.actions[al]
-            for al in sorted_actions
-            if self.actions[al].status == BuildActionStatus.IN_QUEUE
-        ]
-        waiting_new_labels = set([a.label for a in waiting_new])
-        waiting_old_labels = set([a.label for a in self.waiting])
-        if waiting_new_labels != waiting_old_labels:
-            logger.error(
-                f"Missing in new labels: {waiting_old_labels - waiting_new_labels}"
-            )
-            logger.error(
-                f"New in new labels: {waiting_new_labels - waiting_old_labels}"
-            )
-            assert False
-        self.waiting = waiting_new
+            self._update_dependers(action)
+            await self._waiting_or_runable(action)
 
     async def start_running(self, action: BuildAction) -> None:
         logger.debug(f"Starting {action.label}")
         print(f"{action.label}..")
-        assert action.status == BuildActionStatus.IN_QUEUE
+        assert have_not_started(action.status)
+        self.waiting.discard(action.label)
+        self.runable.discard(action.label)
         action.status = BuildActionStatus.RUNNING
         cmd, env = run_action_cmd_env(
             action.label.path, action.label.name, self.invoker
@@ -220,55 +283,266 @@ class ActionExecuterImpl(ActionExecuter):
         proc = await asyncio.create_subprocess_exec(*cmd, env=env)
         logger.debug(f"Running {cmd} with env {env} in {proc.pid=}")
         task = asyncio.create_task(proc.wait())
-        self.running[task] = (proc, action)
-        action.status = BuildActionStatus.RUNNING
+        self.started[task] = (proc, action)
 
-    def action_done(self, task: asyncio.Task[Any]) -> None:
-        assert task in self.running
-        process, action = self.running.pop(task)
+    async def action_done(self, task: asyncio.Task[Any]) -> None:
+        assert task in self.started
+
+        process, action = self.started.pop(task)
         logger.debug(f"{action.label}: {process.returncode}")
         if process.returncode == 0:
             action.status = BuildActionStatus.SUCCESSFULL
             print(f"{action.label} ... Ok")
             for done_cb in action.done_actions:
-                done_cb()
+                await done_cb()
         else:
             print(f"{action.label} ... Failed")
             action.status = BuildActionStatus.FAILED
             if action.needed:
                 self.failures.append(action)
 
-    async def run(self) -> int:
-        while True:
-            if len(self.failures) > 0:
-                failure = self.failures[0]
-                print_failure(failure.label, set([]))
-                return 1
+        logger.info(f"{action.label} is now in status {action.status}")
+        for d in action.dependers:
+            await self._waiting_or_runable(self.actions[d])
 
-            pre_sort = len(self.waiting)
-            if self.need_resort:
-                self.sort_waiting()
-            assert pre_sort == len(self.waiting)
+    def _check_for_deadlock_inner(
+        self, at: ActionLabel, seen: list[ActionLabel]
+    ) -> bool:
+        if at in seen:
+            print(f"Deadlock: {at} ->", file=sys.stderr)
+            for p in seen[::-1]:
+                print(f"   {p} ->", file=sys.stderr)
+            return True
 
-            while len(self.waiting) > 0 and len(self.running) < self.max_running:
-                await self.start_running(self.waiting[0])
-                self.waiting = self.waiting[1:]
+        seen_now = seen + [at]
+        for hd in self.actions[at].hard_deps:
+            if self._check_for_deadlock_inner(hd, seen_now):
+                return True
 
-            if len(self.running) == 0 and len(self.waiting) == 0:
-                return 0
+        return False
 
-            logger.debug(f"Waiting for one of {len(self.running)} actions.")
-            done, pending = await asyncio.wait(
-                [t for t in self.running.keys()],
-                timeout=10,
-                return_when=asyncio.FIRST_COMPLETED,
+    def _check_for_deadlock(self, start: ActionLabel) -> bool:
+        return self._check_for_deadlock_inner(start, [])
+
+    async def _read_from_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        peername = writer.get_extra_info("peername")
+        logger.info(f"Start reading from {peername}")
+        try:
+            while not reader.at_eof():
+                logger.debug(f"Before reading from {peername}")
+                line_bytes = await reader.readline()
+                logger.debug(f"After reading from {peername}: {line_bytes=}")
+
+                if not line_bytes:
+                    break
+                line: str = line_bytes.decode().rstrip()
+                logger.debug(f"Received from {peername}: {line}")
+                split = line.split(" ")
+                if split[0] == "needs:":
+                    invoker_label = label_from_line(unescape_whitespace(split[1]))
+                    to_build = label_from_line(unescape_whitespace(split[2]))
+                    hard = len(split) > 3 and split[3] == "hard"
+                    invoking_action = self.actions[invoker_label]
+                    await self.schedule_action(
+                        BuildAction(to_build, invoking_action.needed)
+                    )
+                    invoking_action.deps.add(to_build)
+                    self._update_dependers(invoking_action)
+
+                    invoking_action.connections.add(writer)
+                    invoking_action.status = BuildActionStatus.BLOCKED
+                    self.blocked.add(invoking_action.label)
+
+                    if hard:
+                        invoking_action.hard_deps.add(to_build)
+                        if self._check_for_deadlock(invoking_action.label):
+                            invoking_action.status = BuildActionStatus.FAILED
+                            self.deadlock_detected = True
+                            self.failures.append(invoking_action)
+
+                    await self._waiting_or_runable(invoking_action)
+                else:
+                    logger.error("Got unknwown command on internal socket:" + line)
+        except asyncio.CancelledError:
+            logger.info(f"Reader task for {peername} cancelled.")
+        except ConnectionResetError:
+            logger.info(f"Reader task for {peername} closed.")
+        except BrokenPipeError:
+            logger.info(f"Reader task for {peername} closed (broken pipe).")
+        except Exception as ex:
+            logger.error("An error occurred", exc_info=True)
+            logger.error(f"Error reading from {peername}: {type(ex)}")
+        finally:
+            logger.info(f"Closing connection from {peername}")
+            self.open_connections.discard(writer)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionResetError:
+                pass
+            except BrokenPipeError:
+                pass
+
+    def remove_connection_reader_task(self, task: asyncio.Task[Any]) -> None:
+        logger.debug("Removing connection")
+        self.connection_reader_tasks.discard(task)
+
+    async def handle_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        peername = writer.get_extra_info("peername")
+        logger.info(f"Received connection from {peername}")
+        self.open_connections.add(writer)
+
+        task = asyncio.create_task(self._read_from_connection(reader, writer))
+        self.connection_reader_tasks.add(task)
+        logger.debug(
+            f"Now there are {len(self.connection_reader_tasks)}/{len(self.open_connections)} connections"
+        )
+        task.add_done_callback(self.remove_connection_reader_task)
+
+    async def unblock(self, action: BuildAction) -> None:
+        assert len(action.connections) > 0
+        for c in action.connections:
+            logger.debug(f"Sending 'try again' to {action.label}")
+            c.write(b"try again\n")
+        self.blocked_runable.remove(action.label)
+        self.status = BuildActionStatus.RUNNING
+
+    def pick_waiter(self) -> BuildAction:
+        return self.pick_one(self.waiting)
+
+    def pick_one(self, runables: set[ActionLabel]) -> BuildAction:
+        best = None
+        best_count = -1
+        for label in runables:
+            action = self.actions[label]
+            c = len(
+                [
+                    l
+                    for l in action.dependers
+                    if not finished_status(self.actions[l].status)
+                ]
             )
-            if len(done) == 0:
-                logger.debug("timeout")
-                continue
+            if c > best_count:
+                best_count = c
+                best = action
 
-            for d in done:
-                self.action_done(d)
+        assert best is not None
+        return best
+
+    async def run(self) -> int:
+        s_path = socket_path()
+        assert s_path is not None
+        server = await asyncio.start_unix_server(
+            self.handle_connection, path=str(s_path)
+        )
+        logger.info(f"Listening on unix socket {socket_path}")
+        for action in self.pending:
+            await self.schedule_action(action)
+        self.pending = []
+        next_print = time.monotonic()
+        try:
+            while True:
+                if len(self.failures) > 0:
+                    failure = self.failures[0]
+                    print_failure(failure.label, set([]))
+                    if self.deadlock_detected:
+                        return 4
+                    else:
+                        return 3
+                now = time.monotonic()
+                if now > next_print:
+                    next_print += 1
+                    for a in self.waiting:
+                        print(f"{a} waiting")
+                    for a in self.runable:
+                        print(f"{a} runable")
+                    for a in self.blocked:
+                        print(f"{a} blocked")
+                    for a in self.blocked_runable:
+                        print(f"{a} blocked runable")
+                    for _, action in self.started.values():
+                        if action.status == BuildActionStatus.RUNNING:
+                            print(f"{action.label} running")
+
+                logger.debug(
+                    f"{len(self.waiting)=} {len(self.runable)=} {len(self.started)=} {len(self.blocked)=}  {len(self.blocked_runable)=}"
+                )
+                while self.running() < self.max_running:
+                    if len(self.blocked_runable) > 0:
+                        await self.unblock(self.pick_one(self.blocked_runable))
+                    elif len(self.runable) > 0:
+                        await self.start_running(self.pick_one(self.runable))
+                    else:
+                        break
+
+                if (
+                    self.running() == 0
+                    and len(self.runable) == 0
+                    and len(self.waiting) > 0
+                ):
+                    # We are stuck - cyclic dependencies
+                    # We can try to force one to start
+                    to_run = self.pick_waiter()
+                    logger.warning(f"Might be in deadlock. Try running {to_run.label}")
+                    await self.start_running(to_run)
+
+                if (
+                    self.running() == 0
+                    and len(self.waiting) == 0
+                    and len(self.runable) == 0
+                    and len(self.blocked) == 0
+                    and len(self.blocked_runable) == 0
+                ):
+                    return 0
+
+                logger.debug(
+                    f"Waiting for one of {len(self.started)} started actions and {len(self.connection_reader_tasks)}/{len(self.open_connections)} connections"
+                )
+                wakeup_task = asyncio.create_task(self.wakeup.get())
+
+                done, pending = await asyncio.wait(
+                    [t for t in self.started.keys()] + [wakeup_task],
+                    timeout=1,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if len(done) == 0:
+                    logger.debug("timeout")
+                    continue
+
+                for d in done:
+                    logger.debug(f"Done d={d}")
+                    if d == wakeup_task:
+                        continue
+                    await self.action_done(d)
+        finally:
+            logger.info("Closing unix socket")
+            for client in self.open_connections:
+                client.close()
+            server.close()
+            await server.wait_closed()
+            logger.info("Unix socket closed")
+            s_path.unlink(missing_ok=True)
+
+            if self.connection_reader_tasks:
+                logger.info(
+                    f"Closing {len(self.connection_reader_tasks)} client connections"
+                )
+                tasks = list(self.connection_reader_tasks)
+                for task in tasks:
+                    task.cancel()
+
+                logger.info("Gather {len(tasks)} connection reader tasks")
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            if self.open_connections:
+                logger.warning(
+                    f"{len(self.open_connections)} connections were not cleaned up properly."
+                )
+            logger.info("Done closing connections")
 
 
 @dataclass(frozen=True)
@@ -277,12 +551,12 @@ class ScheduleAll:
     bf_label: ActionLabel
     categories: frozenset[str]
 
-    def __call__(self) -> None:
+    async def __call__(self) -> None:
         actions = load_actions(self.bf_label.path)
         print(f"Loading all actions {self.bf_label}")
         for label, action in actions.items():
             if action.category in self.categories:
-                self.executer.schedule_action(BuildAction(label, needed=True))
+                await self.executer.schedule_action(BuildAction(label, needed=True))
 
 
 def main_inner(args: list[str]) -> int:
@@ -302,7 +576,8 @@ def main_inner(args: list[str]) -> int:
         logger.info(f"{logger.name} {log_level=}")
     logger.info(f"{arg.verbose=} {logging.getLevelName(log_level)}")
 
-    logger.info(f"Using {os.environ[FUSEBUILD_INVOCATION_DIR]} as invocation dir.")
+    invocation_dir = Path(os.environ[FUSEBUILD_INVOCATION_DIR])
+    logger.info(f"Using {invocation_dir} as invocation dir.")
 
     categories = frozenset(arg.category.split(","))
 
@@ -310,7 +585,10 @@ def main_inner(args: list[str]) -> int:
     max_running = arg.parallel
     if max_running <= 0:
         max_running = cpu_count()
-    executer = ActionExecuterImpl(max_running=max_running)
+    executer = ActionExecuterImpl(
+        max_running=max_running, invocation_dir=invocation_dir
+    )
+
     for ti in arg.target:
         t: Path = ti.absolute()
         logger.debug(f"Processing {ti} at {os.getcwd()=}: {t=}")
@@ -326,7 +604,7 @@ def main_inner(args: list[str]) -> int:
                     needed=True,
                     done_actions={ScheduleAll(executer, bf_label, categories)},
                 )
-                executer.schedule_action(action)
+                executer.schedule_action_nonasync(action)
 
         else:
             while True:
@@ -339,7 +617,7 @@ def main_inner(args: list[str]) -> int:
                 logger.debug(f"{t=} {name=}")
                 build_file = t / "FUSEBUILD.py"
                 if build_file.exists():
-                    executer.schedule_action(
+                    executer.schedule_action_nonasync(
                         BuildAction(ActionLabel(t, name), needed=True)
                     )
                     break

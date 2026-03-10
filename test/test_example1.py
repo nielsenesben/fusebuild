@@ -145,7 +145,7 @@ class TestExample1(TestCase):
                 str(self.workdir) + "/fail",
             ]
         )
-        self.assertEqual(ret.returncode, 1)
+        self.assertEqual(ret.returncode, 3)
 
     def test_handle_change_to_input_under_build(self) -> None:
         with create_tcp_server() as sock:
