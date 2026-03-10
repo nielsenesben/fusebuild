@@ -181,6 +181,7 @@ class ActionExecuterImpl(ActionExecuter):
         self.blocked_runable = set([])
         self.need_resort = False
         self.failures = []
+        self.deadlock_detected = False
         self.max_running = max_running
         self.invoker = DummyInvoker()
         self.invocation_dir = invocation_dir
@@ -358,6 +359,7 @@ class ActionExecuterImpl(ActionExecuter):
                         invoking_action.hard_deps.add(to_build)
                         if self._check_for_deadlock(invoking_action.label):
                             invoking_action.status = BuildActionStatus.FAILED
+                            self.deadlock_detected = True
                             self.failures.append(invoking_action)
 
                     await self._waiting_or_runable(invoking_action)
@@ -447,7 +449,10 @@ class ActionExecuterImpl(ActionExecuter):
                 if len(self.failures) > 0:
                     failure = self.failures[0]
                     print_failure(failure.label, set([]))
-                    return 1
+                    if self.deadlock_detected:
+                        return 4
+                    else:
+                        return 3
                 now = time.monotonic()
                 if now > next_print:
                     next_print += 1

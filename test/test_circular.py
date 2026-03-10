@@ -42,7 +42,7 @@ class TestCircular(TestCase):
             ],
             timeout=60,
         )
-        self.assertEqual(ret.returncode, 1)
+        self.assertEqual(ret.returncode, 4)
 
         # Now testing that breaking the circular dependency will fix the build
         (self.workdir / "FUSEBUILD.py").write_text(
@@ -100,7 +100,7 @@ shell_action(
             ],
             timeout=60,
         )
-        self.assertEqual(ret.returncode, 1)
+        self.assertEqual(ret.returncode, 4)
 
     def test_build_circular_from_out_of_circle(self) -> None:
         ret = subprocess.run(
@@ -113,7 +113,7 @@ shell_action(
             ],
             timeout=60,
         )
-        self.assertEqual(ret.returncode, 1)
+        self.assertEqual(ret.returncode, 4)
 
     def test_circular_fusebuild_files(self) -> None:
         # Avoid original error
@@ -158,7 +158,7 @@ get_action("../subA", "A")
             ],
             timeout=120,
         )
-        self.assertEqual(ret.returncode, 1)
+        self.assertEqual(ret.returncode, 4)
 
 
 if __name__ == "__main__":

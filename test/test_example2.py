@@ -111,7 +111,7 @@ shell_action(name="someaction",
         )
 
         ret = run(build_cmd)
-        self.assertEqual(ret, 1)
+        self.assertEqual(ret, 3)
 
         # Test that failed FUSEBUILD.py gives a failed build
         with (self.workdir / "FUSEBUILD.py").open("w") as f:
@@ -138,7 +138,7 @@ shell_action(name="someaction",
         )
 
         ret = run(build_cmd)
-        self.assertEqual(ret, 1)
+        self.assertEqual(ret, 3)
 
 
 if __name__ == "__main__":
