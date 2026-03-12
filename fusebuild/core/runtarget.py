@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fusebuild.core.action import ActionLabel
 from fusebuild.core.action_invoker import ActionInvoker, DummyInvoker
+from fusebuild.core.errorcodes import ErrorCode
 from fusebuild.core.libfusebuild import ExecuterBase, Status, get_action_executer
 from fusebuild.core.logger import getLogger, setLoggerPrefix
 
@@ -20,14 +21,14 @@ def _runtarget(buildfile: Path, target: str, invoker: ActionInvoker) -> int | No
     assert buildfile.is_file()
     executer = get_action_executer(buildfile.parent, target, invoker)
     match executer:
-        case int(x):
+        case ErrorCode() as err:
             # Some error code
-            return executer
+            return err.value
         case BasicExecuter:
-            return_code = executer.run_if_needed(
+            return_code: ErrorCode = executer.run_if_needed(
                 invoker, f"building {[str(a) for a in invoker.runtarget_args()]}"
             )
-            return return_code
+            return return_code.value
 
 
 if __name__ == "__main__":
