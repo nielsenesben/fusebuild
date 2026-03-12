@@ -151,13 +151,13 @@ class BuildAction:
     deps: set[ActionLabel] = field(default_factory=set)
     hard_deps: set[ActionLabel] = field(default_factory=set)
     dependers: set[ActionLabel] = field(default_factory=set)
-    done_actions: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
+    done_actions: set[Callable[[], None]] = field(default_factory=set)
     connections: set[asyncio.StreamWriter] = field(default_factory=set)
     return_code: ErrorCode | None = None
 
 
 class ActionExecuter(Protocol):
-    async def schedule_action(self, action: BuildAction) -> None:
+    def schedule_action(self, action: BuildAction) -> None:
         """Execute action if it matches category"""
         ...
 
@@ -196,7 +196,7 @@ class ActionExecuterImpl(ActionExecuter):
         for d in action.deps:
             self.actions[d].dependers.add(action.label)
 
-    async def _waiting_or_runable(self, action: BuildAction) -> None:
+    def _waiting_or_runable(self, action: BuildAction) -> None:
         if waiting_status(action.status) or runable_status(action.status):
             undone_dep = False
             for d in action.deps:
@@ -231,7 +231,7 @@ class ActionExecuterImpl(ActionExecuter):
                 case _:
                     assert False
 
-        await self.wakeup.put(None)
+        self.wakeup.put_nowait(None)
         logger.info(f"{action.label} is now in status {action.status}")
 
     def running(self) -> int:
@@ -240,7 +240,7 @@ class ActionExecuterImpl(ActionExecuter):
     def schedule_action_nonasync(self, action: BuildAction) -> None:
         self.pending.append(action)
 
-    async def schedule_action(self, action: BuildAction) -> None:
+    def schedule_action(self, action: BuildAction) -> None:
         self.need_resort = True
         logger.debug(f"Scheduling {action.label}")
         if action.label in self.actions:
@@ -250,7 +250,7 @@ class ActionExecuterImpl(ActionExecuter):
             old_action.needed = old_action.needed or action.needed
             # old_action dependenders already done, only new ones
             self._update_dependers(action)
-            await self._waiting_or_runable(old_action)
+            self._waiting_or_runable(old_action)
         else:
             self.actions[action.label] = action
             self.waiting.add(action.label)
@@ -258,7 +258,7 @@ class ActionExecuterImpl(ActionExecuter):
                 logger.debug(f"Adding dependency {d} for {action.label}")
                 action.deps.add(d)
                 if d not in self.actions:
-                    await self.schedule_action(BuildAction(d, needed=False))
+                    self.schedule_action(BuildAction(d, needed=False))
             if action.label.name != "FUSEBUILD.py":
                 bf_label = ActionLabel(action.label.path, "FUSEBUILD.py")
                 logger.debug(f"Adding {bf_label} for {action.label}")
@@ -266,11 +266,11 @@ class ActionExecuterImpl(ActionExecuter):
                 action.deps.add(bf_label)
                 action.hard_deps.add(bf_label)
                 if bf_label not in self.actions:
-                    await self.schedule_action(BuildAction(bf_label, needed=True))
+                    self.schedule_action(BuildAction(bf_label, needed=True))
                 self._update_dependers(action)
 
             self._update_dependers(action)
-            await self._waiting_or_runable(action)
+            self._waiting_or_runable(action)
 
     async def start_running(self, action: BuildAction) -> None:
         logger.debug(f"Starting {action.label}")
@@ -297,7 +297,7 @@ class ActionExecuterImpl(ActionExecuter):
             action.status = BuildActionStatus.SUCCESSFULL
             print(f"{action.label} ... Ok")
             for done_cb in action.done_actions:
-                await done_cb()
+                done_cb()
         else:
             print(f"{action.label} ... Failed")
             action.status = BuildActionStatus.FAILED
@@ -306,7 +306,7 @@ class ActionExecuterImpl(ActionExecuter):
 
         logger.info(f"{action.label} is now in status {action.status}")
         for d in action.dependers:
-            await self._waiting_or_runable(self.actions[d])
+            self._waiting_or_runable(self.actions[d])
 
     def _check_for_deadlock_inner(
         self, at: ActionLabel, seen: list[ActionLabel]
@@ -348,9 +348,7 @@ class ActionExecuterImpl(ActionExecuter):
                     to_build = label_from_line(unescape_whitespace(split[2]))
                     hard = len(split) > 3 and split[3] == "hard"
                     invoking_action = self.actions[invoker_label]
-                    await self.schedule_action(
-                        BuildAction(to_build, invoking_action.needed)
-                    )
+                    self.schedule_action(BuildAction(to_build, invoking_action.needed))
                     invoking_action.deps.add(to_build)
                     self._update_dependers(invoking_action)
 
@@ -365,7 +363,7 @@ class ActionExecuterImpl(ActionExecuter):
                             self.deadlock_detected = True
                             self.failures.append(invoking_action)
 
-                    await self._waiting_or_runable(invoking_action)
+                    self._waiting_or_runable(invoking_action)
                 else:
                     logger.error("Got unknwown command on internal socket:" + line)
         except asyncio.CancelledError:
@@ -444,7 +442,7 @@ class ActionExecuterImpl(ActionExecuter):
         )
         logger.info(f"Listening on unix socket {socket_path}")
         for action in self.pending:
-            await self.schedule_action(action)
+            self.schedule_action(action)
         self.pending = []
         next_print = time.monotonic()
         try:
@@ -556,12 +554,12 @@ class ScheduleAll:
     bf_label: ActionLabel
     categories: frozenset[str]
 
-    async def __call__(self) -> None:
+    def __call__(self) -> None:
         actions = load_actions(self.bf_label.path)
         print(f"Loading all actions {self.bf_label}")
         for label, action in actions.items():
             if action.category in self.categories:
-                await self.executer.schedule_action(BuildAction(label, needed=True))
+                self.executer.schedule_action(BuildAction(label, needed=True))
 
 
 def main_inner(args: list[str]) -> ErrorCode:
