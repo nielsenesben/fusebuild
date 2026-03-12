@@ -25,6 +25,7 @@ from result import Err, Ok
 from .access_recorder import load_action_deps
 from .action import Action, ActionLabel, label_from_line
 from .action_invoker import ActionInvoker, DummyInvoker
+from .errorcodes import ErrorCode
 from .file_layout import (
     FUSEBUILD_INVOCATION_DIR,
     action_dir,
@@ -152,6 +153,7 @@ class BuildAction:
     dependers: set[ActionLabel] = field(default_factory=set)
     done_actions: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
     connections: set[asyncio.StreamWriter] = field(default_factory=set)
+    return_code: ErrorCode | None = None
 
 
 class ActionExecuter(Protocol):
@@ -290,6 +292,7 @@ class ActionExecuterImpl(ActionExecuter):
 
         process, action = self.started.pop(task)
         logger.debug(f"{action.label}: {process.returncode}")
+        action.return_code = ErrorCode(process.returncode)
         if process.returncode == 0:
             action.status = BuildActionStatus.SUCCESSFULL
             print(f"{action.label} ... Ok")
@@ -433,7 +436,7 @@ class ActionExecuterImpl(ActionExecuter):
         assert best is not None
         return best
 
-    async def run(self) -> int:
+    async def run(self) -> ErrorCode:
         s_path = socket_path()
         assert s_path is not None
         server = await asyncio.start_unix_server(
@@ -450,9 +453,11 @@ class ActionExecuterImpl(ActionExecuter):
                     failure = self.failures[0]
                     print_failure(failure.label, set([]))
                     if self.deadlock_detected:
-                        return 4
+                        return ErrorCode.DEADLOCK
                     else:
-                        return 3
+                        assert failure.return_code is not None
+                        return failure.return_code
+
                 now = time.monotonic()
                 if now > next_print:
                     next_print += 1
@@ -497,7 +502,7 @@ class ActionExecuterImpl(ActionExecuter):
                     and len(self.blocked) == 0
                     and len(self.blocked_runable) == 0
                 ):
-                    return 0
+                    return ErrorCode.SUCCESS
 
                 logger.debug(
                     f"Waiting for one of {len(self.started)} started actions and {len(self.connection_reader_tasks)}/{len(self.open_connections)} connections"
@@ -559,7 +564,7 @@ class ScheduleAll:
                 await self.executer.schedule_action(BuildAction(label, needed=True))
 
 
-def main_inner(args: list[str]) -> int:
+def main_inner(args: list[str]) -> ErrorCode:
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", action="count", default=0)
     parser.add_argument("-j", "--parallel", type=int, default=0)
@@ -612,7 +617,7 @@ def main_inner(args: list[str]) -> int:
                 t_next = t.parent
                 if t_next == t:
                     print(f"Can't find build file matching {ti}", file=sys.stderr)
-                    return 1
+                    return ErrorCode.INVALID_INPUT
                 t = t_next
                 logger.debug(f"{t=} {name=}")
                 build_file = t / "FUSEBUILD.py"
@@ -691,7 +696,7 @@ def main(args: list[str]) -> int:
         try:
             ret = main_inner(args)
             logger.info(f"Result of main: {ret}")
-            return ret
+            return ret.value
         finally:
             signal_handler(tmp_dir, signal.SIGHUP)
 

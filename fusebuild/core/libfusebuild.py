@@ -86,6 +86,7 @@ from fusebuild.core.file_layout import (
 )
 
 from .action_invoker import ActionInvoker, WaitingFor
+from .errorcodes import ErrorCode
 from .fuse_mount import BasicMount, unmount
 from .utils import check_pid, escape_whitespace, kill_subprocess, os_environ, run_action
 
@@ -362,7 +363,7 @@ class BasicExecuter(ExecuterBase):
             with done_file.open("w") as f:
                 f.write(f"{retcode}\n")
 
-    def run(self) -> int | None:
+    def run(self) -> ErrorCode:
         self.status = StatusEnum.RUNNING
         self.write_status()
 
@@ -409,7 +410,7 @@ class BasicExecuter(ExecuterBase):
                 logger.error(
                     f"Mount on {mountpoint=} before build process started {self.fuse_mount.returncode=}"
                 )
-                return -1
+                return ErrorCode.INTERNAL_ERROR
             except psutil.TimeoutExpired:
                 pass
 
@@ -457,6 +458,11 @@ class BasicExecuter(ExecuterBase):
                                 self.build_process.wait(1.0)
                             )
                             self.build_process = None
+                            error_code = (
+                                ErrorCode.SUCCESS
+                                if self.action_setup_record.return_code == 0
+                                else ErrorCode.ACTION_FAILED
+                            )
                             break
                         except psutil.TimeoutExpired:
                             pass
@@ -465,6 +471,7 @@ class BasicExecuter(ExecuterBase):
                             logger.error("Fuse mount exited too early")
                             assert self.build_process is not None
                             self.action_setup_record.return_code = -1
+                            error_code = ErrorCode.INTERNAL_ERROR
                             break
 
                         subbuild_failed = subbuild_failed_path.exists()
@@ -473,6 +480,7 @@ class BasicExecuter(ExecuterBase):
                                 f"Subbuild for {self.label} failed: {subbuild_failed_path.read_text()}, setting return code to -1"
                             )
                             self.action_setup_record.return_code = -1
+                            error_code = ErrorCode.ACTION_FAILED
             logger.debug(f"{self.cmd} done: {self.action_setup_record.return_code}")
 
             logger.debug(
@@ -482,13 +490,14 @@ class BasicExecuter(ExecuterBase):
             if subbuild_failed:
                 logger.info("Return code == 0 but subbuild failed")
                 self.action_setup_record.return_code = -1
-
+                error_code = ErrorCode.ACTION_FAILED
             assert self.action_setup_record.return_code is not None
             self.mark_as_done(self.action_setup_record.return_code)
         except Exception as e:
             logger.error(
                 f"Something went wrong when spawning {self.directory} / {self.name}: {e=}"
             )
+            error_code = ErrorCode.INTERNAL_ERROR
             raise
         finally:
             logger.debug(f"Finally {mountpoint}")
@@ -506,6 +515,11 @@ class BasicExecuter(ExecuterBase):
                         logger.debug(f"build process stopped: {return_code}")
                         # too late to use a good return code, something is wrong if it build process was running here
                         self.build_process = None
+                        error_code = (
+                            ErrorCode.SUCCESS
+                            if return_code == 0
+                            else ErrorCode.ACTION_FAILED
+                        )
                     except psutil.TimeoutExpired:
                         logger.debug("Timeput while waiting for build process to stop")
                         assert self.fuse_mount is not None
@@ -529,6 +543,7 @@ class BasicExecuter(ExecuterBase):
                             logger.error(
                                 f"Fuse mount didn't return ok: {fuse_return_code=}"
                             )
+                            error_code = ErrorCode.INTERNAL_ERROR
                             self.action_setup_record.return_code = -1
                         self.fuse_mount = None
                     except psutil.TimeoutExpired:
@@ -549,7 +564,7 @@ class BasicExecuter(ExecuterBase):
             f.write(json.dumps(first_dict) + "\n")
 
         self.release_lock()
-        return self.action_setup_record.return_code
+        return error_code
 
     def release_lock(self) -> None:
         self.status = StatusEnum.DONE
@@ -718,26 +733,25 @@ class BasicExecuter(ExecuterBase):
         else:
             return Ok(True)
 
-    def run_if_needed(self, invoker: ActionInvoker, reason: str) -> int | None:
+    def run_if_needed(self, invoker: ActionInvoker, reason: str) -> ErrorCode:
         with invoker.waiting_for(self.label) as waiter:
             needs_rebuild = self.needs_rebuild(reason)
             logger.debug(f"{self.label} needs_rebuild: {needs_rebuild}")
             match needs_rebuild:
                 case Ok(False):
-                    return 0
+                    return ErrorCode.SUCCESS
                 case Ok(True):
                     pass
                 case Err(True):
-                    return -1
+                    return ErrorCode.DEADLOCK
                 case _:
                     assert False
             if (
                 has_invocation_dir()
                 and (failed_file := invocation_failed_file(self.label)).exists()
             ):
-                retcode = int(failed_file.read_text())
-                logger.info(f"{self.label} failed with {retcode=}")
-                return retcode
+                logger.info(f"{self.label} failed before")
+                return ErrorCode.ACTION_FAILED
             elif self.incremental:
                 logger.info(
                     f"Incremantal - run {self.full_path} again without cleaning"
@@ -880,7 +894,7 @@ def load_actions(path: Path) -> dict[ActionLabel, Action]:
 
 def check_build_file(
     buildfile: Path, invoker: ActionInvoker, looking_for: ActionLabel
-) -> Result[dict[ActionLabel, Action], int | None]:
+) -> Result[dict[ActionLabel, Action], ErrorCode | None]:
     logger.debug(f"check_build_file({buildfile})")
     buildfile = buildfile.absolute()
 
@@ -895,7 +909,7 @@ def check_build_file(
         case True:
             return Ok(load_actions(buildfile.parent))
         case False:
-            return Err(1)
+            return Err(ErrorCode.BUILDFILE_FAILED)
         case None:
             pass
 
@@ -905,7 +919,7 @@ def check_build_file(
     if ret is not None:
         executer.release_lock()
     logger.debug(f"LoadBuildFileAction({buildfile}) {ret=}")
-    if ret != 0 and ret is not None:
+    if ret != ErrorCode.SUCCESS and ret is not None:
         return Err(ret)
 
     return Ok(load_actions(buildfile.parent))
@@ -913,7 +927,7 @@ def check_build_file(
 
 def get_action(
     path: Path | str, action: str, invoker: ActionInvoker
-) -> Action | None | int:
+) -> Action | None | ErrorCode:
     logger.debug(f"get_action({path}, {action})")
     if isinstance(path, str):
         path = Path(path)
@@ -952,14 +966,14 @@ class NonExistingActionExecuter(BasicExecuter):
     def __init__(self, label: ActionLabel):
         super(NonExistingActionExecuter, self).__init__(label, noaction)
 
-    def run_if_needed(self, invoker: ActionInvoker, reason: str) -> int:
+    def run_if_needed(self, invoker: ActionInvoker, reason: str) -> ErrorCode:
         self.mark_as_done(0)
-        return 0
+        return ErrorCode.SUCCESS
 
 
 def get_action_executer(
     p: Path, name: str, invoker: ActionInvoker
-) -> BasicExecuter | int:
+) -> BasicExecuter | ErrorCode:
     if name == "FUSEBUILD.py":
         return LoadBuildFileExecuter(p / name)
 
@@ -971,8 +985,8 @@ def get_action_executer(
     match action:
         case None:
             return NonExistingActionExecuter(ActionLabel(p, name))
-        case int(res):
-            return res
+        case ErrorCode() as err:
+            return err
         case _:
             return ActionExecuter(ActionLabel(p, name), action)
 
