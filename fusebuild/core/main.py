@@ -287,7 +287,7 @@ class ActionExecuterImpl(ActionExecuter):
         task = asyncio.create_task(proc.wait())
         self.started[task] = (proc, action)
 
-    async def action_done(self, task: asyncio.Task[Any]) -> None:
+    def action_done(self, task: asyncio.Task[Any]) -> None:
         assert task in self.started
 
         process, action = self.started.pop(task)
@@ -404,7 +404,7 @@ class ActionExecuterImpl(ActionExecuter):
         )
         task.add_done_callback(self.remove_connection_reader_task)
 
-    async def unblock(self, action: BuildAction) -> None:
+    def unblock(self, action: BuildAction) -> None:
         assert len(action.connections) > 0
         for c in action.connections:
             logger.debug(f"Sending 'try again' to {action.label}")
@@ -476,7 +476,7 @@ class ActionExecuterImpl(ActionExecuter):
                 )
                 while self.running() < self.max_running:
                     if len(self.blocked_runable) > 0:
-                        await self.unblock(self.pick_one(self.blocked_runable))
+                        self.unblock(self.pick_one(self.blocked_runable))
                     elif len(self.runable) > 0:
                         await self.start_running(self.pick_one(self.runable))
                     else:
@@ -520,7 +520,7 @@ class ActionExecuterImpl(ActionExecuter):
                     logger.debug(f"Done d={d}")
                     if d == wakeup_task:
                         continue
-                    await self.action_done(d)
+                    self.action_done(d)
         finally:
             logger.info("Closing unix socket")
             for client in self.open_connections:
