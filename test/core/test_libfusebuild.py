@@ -35,9 +35,11 @@ class TestGetAction(TestCase):
         self.common_test_fusebuild_py_action(Path(__file__).parent)
 
     def test_fusebuild_py_nonexisting_dir(self) -> None:
-        """Tests that we can always hit the special branch of FUSEBUIlD.py
-        even though the directory doesn't exists"""
-        self.common_test_fusebuild_py_action("nonexistingdir")
+        """Tests that we get None hit when the directory doesn't exists"""
+        path = Path("nonexistingdir")
+        invoker = MagicMock(ActionInvoker)
+        action = get_action(path, "FUSEBUILD.py", invoker)
+        self.assertIsNone(action)
 
 
 if __name__ == "__main__":
