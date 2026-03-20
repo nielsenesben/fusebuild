@@ -410,7 +410,7 @@ class ActionExecuterImpl(ActionExecuter):
             logger.debug(f"Sending 'try again' to {action.label}")
             c.write(b"try again\n")
         self.blocked_runable.remove(action.label)
-        self.status = BuildActionStatus.RUNNING
+        action.status = BuildActionStatus.RUNNING
 
     def pick_waiter(self) -> BuildAction:
         return self.pick_one(self.waiting)
@@ -418,18 +418,32 @@ class ActionExecuterImpl(ActionExecuter):
     def pick_one(self, runables: set[ActionLabel]) -> BuildAction:
         best = None
         best_count = -1
+        best_hard_count = 0
         for label in runables:
             action = self.actions[label]
-            c = len(
+            hard_c = len(
                 [
                     l
                     for l in action.dependers
                     if not finished_status(self.actions[l].status)
+                    and label in self.actions[l].hard_deps
                 ]
             )
-            if c > best_count:
-                best_count = c
+            if hard_c > best_hard_count:
                 best = action
+                best_hard_count = hard_c
+            elif best_hard_count == 0:
+                # We have none with hard dependers yet
+                c = len(
+                    [
+                        l
+                        for l in action.dependers
+                        if not finished_status(self.actions[l].status)
+                    ]
+                )
+                if c > best_count:
+                    best_count = c
+                    best = action
 
         assert best is not None
         return best
