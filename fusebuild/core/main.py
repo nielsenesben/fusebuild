@@ -276,9 +276,6 @@ class ActionExecuterImpl(ActionExecuter):
         logger.debug(f"Starting {action.label}")
         print(f"{action.label}..")
         assert have_not_started(action.status)
-        self.waiting.discard(action.label)
-        self.runable.discard(action.label)
-        action.status = BuildActionStatus.RUNNING
         cmd, env = run_action_cmd_env(
             action.label.path, action.label.name, self.invoker
         )
@@ -286,6 +283,9 @@ class ActionExecuterImpl(ActionExecuter):
         logger.debug(f"Running {cmd} with env {env} in {proc.pid=}")
         task = asyncio.create_task(proc.wait())
         self.started[task] = (proc, action)
+        self.waiting.discard(action.label)
+        self.runable.discard(action.label)
+        action.status = BuildActionStatus.RUNNING
 
     def action_done(self, task: asyncio.Task[Any]) -> None:
         assert task in self.started
