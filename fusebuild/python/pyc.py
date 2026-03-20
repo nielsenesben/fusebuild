@@ -26,7 +26,7 @@ def pyc_actions(t: Path = topdir(Path("."))) -> None:
 def pyc_mappings(td: Path = topdir(Path("."))) -> list[PatternRemapToOutput]:
     return [
         PatternRemapToOutput(
-            f"({td.absolute()}.*)/__pycache__/(.*)\.(.*)\.pyc(.*)",
+            f"({td.absolute()}.*)/__pycache__/(.*)\\.(.*)\\.pyc(.*)",
             "\\1/\\2_gen_pyc/\\2.\\3.pyc\\4",
         ),
         PatternRemapToOutput(
