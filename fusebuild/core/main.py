@@ -264,6 +264,7 @@ class ActionExecuterImpl(ActionExecuter):
             for d in load_action_deps(action.label):
                 logger.debug(f"Adding dependency {d} for {action.label}")
                 action.deps.add(d)
+            for d in action.deps:
                 if d not in self.actions:
                     self.schedule_action(BuildAction(d, needed=False))
             if action.label.name != "FUSEBUILD.py":

@@ -172,6 +172,29 @@ class TestActionExecuter(unittest.IsolatedAsyncioTestCase):
             self.executer.actions[blocker_label].status, BuildActionStatus.SUCCESSFULL
         )
 
+    def test_pick_one(self) -> None:
+        A = BuildAction(ActionLabel(Path("/"), "A"), True)
+        B = BuildAction(ActionLabel(Path("/"), "B"), True)
+        C = ActionLabel(Path("/"), "C")
+        D = BuildAction(ActionLabel(Path("/"), "D"), True)
+        E = ActionLabel(Path("/"), "E")
+        A.deps.add(C)
+        B.deps.add(C)
+        D.deps.add(E)
+        self.executer.schedule_action(A)
+        self.executer.schedule_action(B)
+        self.assertIn(C, self.executer.actions)
+        self.executer.schedule_action(D)
+        self.assertIn(E, self.executer.actions)
+        self.assertEqual(
+            self.executer.pick_one(set([A.label, B.label, C, D.label, E])).label, C
+        )
+
+        D.hard_deps.add(E)
+        self.assertEqual(
+            self.executer.pick_one(set([A.label, B.label, C, D.label, E])).label, E
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
