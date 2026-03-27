@@ -153,7 +153,14 @@ class BuildAction:
     dependers: set[ActionLabel] = field(default_factory=set)
     done_actions: set[Callable[[], None]] = field(default_factory=set)
     connections: set[asyncio.StreamWriter] = field(default_factory=set)
-    return_code: ErrorCode | None = None
+    process: asyncio.subprocess.Process | None = None
+
+    @property
+    def return_code(self) -> ErrorCode | None:
+        if self.process is None:
+            return None
+        else:
+            return ErrorCode(self.process.returncode)
 
 
 class ActionExecuter(Protocol):
@@ -166,7 +173,7 @@ class ActionExecuterImpl(ActionExecuter):
     actions: dict[ActionLabel, BuildAction]
     waiting: set[ActionLabel]
     runable: set[ActionLabel]
-    started: dict[asyncio.Task[Any], tuple[asyncio.subprocess.Process, BuildAction]]
+    started: dict[asyncio.Task[Any], BuildAction]
     blocked: set[ActionLabel]
     blocked_runable: set[ActionLabel]
     failures: list[BuildAction]
@@ -257,6 +264,7 @@ class ActionExecuterImpl(ActionExecuter):
             for d in load_action_deps(action.label):
                 logger.debug(f"Adding dependency {d} for {action.label}")
                 action.deps.add(d)
+            for d in action.deps:
                 if d not in self.actions:
                     self.schedule_action(BuildAction(d, needed=False))
             if action.label.name != "FUSEBUILD.py":
@@ -272,28 +280,33 @@ class ActionExecuterImpl(ActionExecuter):
             self._update_dependers(action)
             self._waiting_or_runable(action)
 
-    async def start_running(self, action: BuildAction) -> None:
+    def start_running(self, action: BuildAction) -> None:
         logger.debug(f"Starting {action.label}")
         print(f"{action.label}..")
         assert have_not_started(action.status)
-        self.waiting.discard(action.label)
-        self.runable.discard(action.label)
-        action.status = BuildActionStatus.RUNNING
         cmd, env = run_action_cmd_env(
             action.label.path, action.label.name, self.invoker
         )
-        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
-        logger.debug(f"Running {cmd} with env {env} in {proc.pid=}")
-        task = asyncio.create_task(proc.wait())
-        self.started[task] = (proc, action)
+        logger.debug(f"{cmd=}")
+
+        async def actual_start() -> None:
+            proc = await asyncio.create_subprocess_exec(*cmd, env=env)
+            logger.debug(f"Running {cmd} with env {env} in {proc.pid=}")
+            action.process = proc
+            await proc.wait()
+
+        task = asyncio.create_task(actual_start())
+        self.started[task] = action
+        self.waiting.discard(action.label)
+        self.runable.discard(action.label)
+        action.status = BuildActionStatus.RUNNING
 
     def action_done(self, task: asyncio.Task[Any]) -> None:
         assert task in self.started
 
-        process, action = self.started.pop(task)
-        logger.debug(f"{action.label}: {process.returncode}")
-        action.return_code = ErrorCode(process.returncode)
-        if process.returncode == 0:
+        action = self.started.pop(task)
+        logger.debug(f"{action.label}: {action.return_code}")
+        if action.return_code == ErrorCode.SUCCESS:
             action.status = BuildActionStatus.SUCCESSFULL
             print(f"{action.label} ... Ok")
             for done_cb in action.done_actions:
@@ -410,7 +423,7 @@ class ActionExecuterImpl(ActionExecuter):
             logger.debug(f"Sending 'try again' to {action.label}")
             c.write(b"try again\n")
         self.blocked_runable.remove(action.label)
-        self.status = BuildActionStatus.RUNNING
+        action.status = BuildActionStatus.RUNNING
 
     def pick_waiter(self) -> BuildAction:
         return self.pick_one(self.waiting)
@@ -418,18 +431,32 @@ class ActionExecuterImpl(ActionExecuter):
     def pick_one(self, runables: set[ActionLabel]) -> BuildAction:
         best = None
         best_count = -1
+        best_hard_count = 0
         for label in runables:
             action = self.actions[label]
-            c = len(
+            hard_c = len(
                 [
                     l
                     for l in action.dependers
                     if not finished_status(self.actions[l].status)
+                    and label in self.actions[l].hard_deps
                 ]
             )
-            if c > best_count:
-                best_count = c
+            if hard_c > best_hard_count:
                 best = action
+                best_hard_count = hard_c
+            elif best_hard_count == 0:
+                # We have none with hard dependers yet
+                c = len(
+                    [
+                        l
+                        for l in action.dependers
+                        if not finished_status(self.actions[l].status)
+                    ]
+                )
+                if c > best_count:
+                    best_count = c
+                    best = action
 
         assert best is not None
         return best
@@ -453,8 +480,9 @@ class ActionExecuterImpl(ActionExecuter):
                     if self.deadlock_detected:
                         return ErrorCode.DEADLOCK
                     else:
-                        assert failure.return_code is not None
-                        return failure.return_code
+                        rc = failure.return_code
+                        assert rc is not None
+                        return rc
 
                 now = time.monotonic()
                 if now > next_print:
@@ -467,7 +495,7 @@ class ActionExecuterImpl(ActionExecuter):
                         print(f"{a} blocked")
                     for a in self.blocked_runable:
                         print(f"{a} blocked runable")
-                    for _, action in self.started.values():
+                    for action in self.started.values():
                         if action.status == BuildActionStatus.RUNNING:
                             print(f"{action.label} running")
 
@@ -478,7 +506,7 @@ class ActionExecuterImpl(ActionExecuter):
                     if len(self.blocked_runable) > 0:
                         self.unblock(self.pick_one(self.blocked_runable))
                     elif len(self.runable) > 0:
-                        await self.start_running(self.pick_one(self.runable))
+                        self.start_running(self.pick_one(self.runable))
                     else:
                         break
 
@@ -491,7 +519,7 @@ class ActionExecuterImpl(ActionExecuter):
                     # We can try to force one to start
                     to_run = self.pick_waiter()
                     logger.warning(f"Might be in deadlock. Try running {to_run.label}")
-                    await self.start_running(to_run)
+                    self.start_running(to_run)
 
                 if (
                     self.running() == 0
