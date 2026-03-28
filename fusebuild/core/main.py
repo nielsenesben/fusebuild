@@ -505,7 +505,9 @@ class ActionExecuterImpl(ActionExecuter):
                 while self.running() < self.max_running:
                     if len(self.blocked_runable) > 0:
                         self.unblock(self.pick_one(self.blocked_runable))
-                    elif len(self.runable) > 0:
+                    elif len(self.runable) > 0 and (
+                        len(self.started) < self.max_running or self.running() == 0
+                    ):
                         self.start_running(self.pick_one(self.runable))
                     else:
                         break
